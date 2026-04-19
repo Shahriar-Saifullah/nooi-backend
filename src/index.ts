@@ -4,6 +4,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
+import cookieParser from 'cookie-parser';
 
 import authRoutes     from './routes/auth.routes';
 import projectRoutes  from './routes/projects.routes';
@@ -21,6 +22,7 @@ app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
 // Middleware
 app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true }));
 app.use(express.json());
+app.use(cookieParser());
 
 // Health check
 app.get('/health', (req, res) => {
