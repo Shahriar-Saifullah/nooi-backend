@@ -1,5 +1,5 @@
 import 'dotenv/config'; // 👈 MUST BE FIRST LINE
-
+import cookieParser from 'cookie-parser';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -21,6 +21,7 @@ app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
 // Middleware
 app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true }));
 app.use(express.json());
+app.use(cookieParser());
 
 // Health check
 app.get('/health', (req, res) => {
