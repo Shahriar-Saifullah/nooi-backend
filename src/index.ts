@@ -1,10 +1,9 @@
 import 'dotenv/config'; // 👈 MUST BE FIRST LINE
-
+import cookieParser from 'cookie-parser';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import cookieParser from 'cookie-parser';
 
 import authRoutes     from './routes/auth.routes';
 import projectRoutes  from './routes/projects.routes';
