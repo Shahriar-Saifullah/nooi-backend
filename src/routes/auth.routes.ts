@@ -1,10 +1,14 @@
 import { Router } from 'express';
+import { signup, login, logout, getMe } from '../controllers/auth.controller';
+import { validate }     from '../middleware/validate';
+import { requireAuth }  from '../middleware/auth.middleware';
+import { signupSchema, loginSchema } from '../schemas/auth.schema';
+
 const router = Router();
 
-// Dev 1 will implement these
-router.post('/signup',  (req, res) => res.json({ message: 'signup - coming soon' }));
-router.post('/login',   (req, res) => res.json({ message: 'login - coming soon' }));
-router.post('/logout',  (req, res) => res.json({ message: 'logout - coming soon' }));
-router.get('/me',       (req, res) => res.json({ message: 'me - coming soon' }));
+router.post('/signup',  validate(signupSchema), signup);
+router.post('/login',   validate(loginSchema),  login);
+router.post('/logout',  logout);
+router.get('/me',       requireAuth, getMe);
 
 export default router;
