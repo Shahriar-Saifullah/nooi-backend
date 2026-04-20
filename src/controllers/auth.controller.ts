@@ -102,21 +102,18 @@ export async function logout(req: Request, res: Response) {
 
 export async function getMe(req: AuthRequest, res: Response) {
   try {
-    const userId = req.user!.id;
+    const user = req.user!;
 
-
-    const { data: profile, error } = await supabase
-      .from('profiles')
-      .select('id, full_name, avatar_url, plan, created_at')
-      .eq('id', userId)
-      .single();
-
-    if (error || !profile) {
-      return res.status(404).json({ success: false, error: 'Profile not found' });
-    }
-
-    return res.status(200).json({ success: true, data: { profile } });
-
+    return res.status(200).json({
+      success: true,
+      data: {
+        user: {
+          id: user.id,
+          email: user.email,
+          full_name: user.user_metadata?.full_name || 'No Name',
+        },
+      },
+    });
   } catch (err) {
     console.error('GetMe error:', err);
     return res.status(500).json({ success: false, error: 'Internal server error' });
