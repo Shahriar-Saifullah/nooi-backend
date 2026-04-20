@@ -61,22 +61,23 @@ export async function login(req: Request, res: Response) {
       });
     }
 
+    // Set accessToken in HttpOnly cookie
     res.cookie('access_token', data.session.access_token, {
       httpOnly: true,
-      secure:   process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge:   60 * 60 * 24 * 7 * 1000, // 7 days
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 60 * 60 * 1000, // 1 hour
+      path: '/',
     });
 
     return res.status(200).json({
       success: true,
       data: {
         user: {
-          id:        data.user.id,
-          email:     data.user.email,
+          id: data.user.id,
+          email: data.user.email,
           full_name: data.user.user_metadata.full_name,
         },
-        access_token: data.session.access_token,
       },
     });
 
@@ -89,7 +90,9 @@ export async function login(req: Request, res: Response) {
 
 export async function logout(req: Request, res: Response) {
   try {
-    res.clearCookie('access_token');
+    res.clearCookie('access_token', {
+      path: '/',
+    });
     return res.status(200).json({ success: true, message: 'Logged out successfully' });
   } catch (err) {
     return res.status(500).json({ success: false, error: 'Internal server error' });
@@ -99,21 +102,18 @@ export async function logout(req: Request, res: Response) {
 
 export async function getMe(req: AuthRequest, res: Response) {
   try {
-    const userId = req.user!.id;
+    const user = req.user!;
 
-
-    const { data: profile, error } = await supabase
-      .from('profiles')
-      .select('id, full_name, avatar_url, plan, created_at')
-      .eq('id', userId)
-      .single();
-
-    if (error || !profile) {
-      return res.status(404).json({ success: false, error: 'Profile not found' });
-    }
-
-    return res.status(200).json({ success: true, data: { profile } });
-
+    return res.status(200).json({
+      success: true,
+      data: {
+        user: {
+          id: user.id,
+          email: user.email,
+          full_name: user.user_metadata?.full_name || 'No Name',
+        },
+      },
+    });
   } catch (err) {
     console.error('GetMe error:', err);
     return res.status(500).json({ success: false, error: 'Internal server error' });

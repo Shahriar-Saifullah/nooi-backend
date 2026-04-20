@@ -8,7 +8,7 @@ const router = Router();
 
 router.post('/signup',  validate(signupSchema), signup);
 router.post('/login',   validate(loginSchema),  login);
-router.post('/logout',  logout);
+router.post('/logout',  requireAuth, logout);
 router.get('/me',       requireAuth, getMe);
 
 export default router;
