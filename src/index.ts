@@ -10,6 +10,7 @@ import projectRoutes  from './routes/projects.routes';
 import aiRoutes       from './routes/ai.routes';
 import orderRoutes    from './routes/orders.routes';
 import { errorHandler } from './middleware/errorHandler';
+import onboardingRoutes from './routes/onboarding.routes';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -33,6 +34,7 @@ app.use('/auth', authRoutes);
 app.use('/projects', projectRoutes);
 app.use('/ai', aiRoutes);
 app.use('/orders', orderRoutes);
+app.use('/onboarding', onboardingRoutes);
 
 // Error handler
 app.use(errorHandler);

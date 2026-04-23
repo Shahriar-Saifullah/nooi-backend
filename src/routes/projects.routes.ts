@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { requireAuth } from '../middleware/auth.middleware';
 const router = Router();
 
-// Dev 1 will implement these
+
 router.get('/',       requireAuth, (req, res) => res.json({ message: 'list projects' }));
 router.post('/',      requireAuth, (req, res) => res.json({ message: 'create project' }));
 router.get('/:id',    requireAuth, (req, res) => res.json({ message: 'get project' }));
