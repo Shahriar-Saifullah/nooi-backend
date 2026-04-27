@@ -7,16 +7,31 @@ import { OnboardingInput } from '../schemas/onboarding.schema';
 export async function savePreferences(req: AuthRequest, res: Response) {
   try {
     const userId = req.user!.id;
+
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('onboarding_completed')
+      .eq('id', userId)
+      .single();
+
+    if (profile?.onboarding_completed) {
+      return res.status(403).json({
+        success: false,
+        error: 'Onboarding already completed.',
+        code: 'ONBOARDING_ALREADY_COMPLETED',
+      });
+    }
+
     const { user_type, project_types, interested_topics } = req.body as OnboardingInput;
 
     const { error: prefError } = await supabase
       .from('user_preferences')
       .upsert({
-        user_id:           userId,
+        user_id: userId,
         user_type,
         project_types,
         interested_topics,
-        updated_at:        new Date().toISOString(),
+        updated_at: new Date().toISOString(),
       }, { onConflict: 'user_id' });
 
     if (prefError) {
