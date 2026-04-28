@@ -7,10 +7,6 @@ export const signupSchema = z.object({
     .min(8, 'Password must be at least 8 characters')
     .regex(/[A-Z]/, 'Password must contain at least one uppercase letter')
     .regex(/[0-9]/, 'Password must contain at least one number'),
-  confirm_password: z.string().min(1, 'Please confirm your password'),  // ADDED
-}).refine((data) => data.password === data.confirm_password, {           // ADDED
-  message: 'Passwords do not match',
-  path: ['confirm_password'],
 });
 
 export const loginSchema = z.object({
