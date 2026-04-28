@@ -21,7 +21,7 @@ const PORT = process.env.PORT || 3001;
 
 // Security
 app.use(helmet());
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 1000 }));
 
 // Middleware
 const allowedOrigins = process.env.FRONTEND_URL
