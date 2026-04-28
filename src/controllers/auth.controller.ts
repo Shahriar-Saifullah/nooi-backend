@@ -88,8 +88,8 @@ export async function login(req: Request, res: Response) {
 
     res.cookie('access_token', data.session.access_token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
+      secure: true,  // always true, required for sameSite: 'none'
+      sameSite: 'none',
       maxAge: 60 * 60 * 24 * 7 * 1000, // 7 days
       path: '/',
     });
@@ -118,6 +118,9 @@ export async function login(req: Request, res: Response) {
 export async function logout(req: Request, res: Response) {
   try {
     res.clearCookie('access_token', {
+      httpOnly: true,
+      secure: true,
+      sameSite: 'none',
       path: '/',
     });
     return res.status(200).json({ success: true, message: 'Logged out successfully' });
@@ -132,11 +135,12 @@ export async function googleSignIn(req: Request, res: Response) {
     const verifier = crypto.randomBytes(32).toString('base64url');
     const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
 
+    // ✅ This should be sb-code-verifier, not access_token
     res.cookie('sb-code-verifier', verifier, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 10 * 60 * 1000,
+      secure: true,
+      sameSite: 'none',
+      maxAge: 10 * 60 * 1000, // 10 minutes
     });
 
     const { data, error } = await supabase.auth.signInWithOAuth({
@@ -203,9 +207,14 @@ export async function authCallback(req: Request, res: Response) {
     const { data, error } = await tempSupabase.auth.exchangeCodeForSession(code);
     if (error) throw error;
 
-    res.clearCookie('sb-code-verifier');
+    res.clearCookie('sb-code-verifier', {
+      httpOnly: true,
+      secure: true,
+      sameSite: 'none',
+      path: '/',
+    });
 
- 
+
     const { data: profile } = await supabase
       .from('profiles')
       .select('full_name, plan, onboarding_completed')
@@ -218,11 +227,11 @@ export async function authCallback(req: Request, res: Response) {
       data.user.user_metadata?.name ??
       null;
 
-  
+
     res.cookie('access_token', data.session.access_token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
+      secure: true,
+      sameSite: 'none',
       maxAge: 60 * 60 * 24 * 7 * 1000,
       path: '/',
     });

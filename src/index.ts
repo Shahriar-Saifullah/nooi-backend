@@ -39,7 +39,6 @@ app.use('/projects', projectRoutes);
 app.use('/ai', aiRoutes);
 app.use('/orders', orderRoutes);
 app.use('/onboarding', onboardingRoutes);
-app.use('/projects', projectRoutes);
 app.use('/profile', profileRoutes);
 
 // Error handler
