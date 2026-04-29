@@ -11,6 +11,15 @@ import { AuthRequest } from '../types';
 import crypto from 'crypto';
 import { createClient } from '@supabase/supabase-js';
 
+const isProd = process.env.NODE_ENV === 'production';
+
+const cookieOptions = {
+  httpOnly: true,
+  secure: isProd,
+  sameSite: (isProd ? 'none' : 'lax') as 'none' | 'lax',
+  path: '/',
+};
+
 
 
 export async function signup(req: Request, res: Response) {
@@ -87,11 +96,13 @@ export async function login(req: Request, res: Response) {
 
 
     res.cookie('access_token', data.session.access_token, {
-      httpOnly: true,
-      secure: true,  // always true, required for sameSite: 'none'
-      sameSite: 'none',
-      maxAge: 60 * 60 * 24 * 7 * 1000, // 7 days
-      path: '/',
+      ...cookieOptions,
+      maxAge: 60 * 60 * 24 * 7 * 1000,
+    });
+
+    res.cookie('refresh_token', data.session.refresh_token, {
+      ...cookieOptions,
+      maxAge: 60 * 60 * 24 * 30 * 1000,
     });
 
 
@@ -117,12 +128,8 @@ export async function login(req: Request, res: Response) {
 
 export async function logout(req: Request, res: Response) {
   try {
-    res.clearCookie('access_token', {
-      httpOnly: true,
-      secure: true,
-      sameSite: 'none',
-      path: '/',
-    });
+    res.clearCookie('access_token', cookieOptions);
+    res.clearCookie('refresh_token', cookieOptions);
     return res.status(200).json({ success: true, message: 'Logged out successfully' });
   } catch (err) {
     return res.status(500).json({ success: false, error: 'Internal server error' });
@@ -135,12 +142,9 @@ export async function googleSignIn(req: Request, res: Response) {
     const verifier = crypto.randomBytes(32).toString('base64url');
     const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
 
-    // ✅ This should be sb-code-verifier, not access_token
     res.cookie('sb-code-verifier', verifier, {
-      httpOnly: true,
-      secure: true,
-      sameSite: 'none',
-      maxAge: 10 * 60 * 1000, // 10 minutes
+      ...cookieOptions,
+      maxAge: 10 * 60 * 1000,
     });
 
     const { data, error } = await supabase.auth.signInWithOAuth({
@@ -173,17 +177,11 @@ export async function authCallback(req: Request, res: Response) {
     const verifier = req.cookies['sb-code-verifier'];
 
     if (!code) {
-      return res.status(400).json({
-        success: false,
-        error: 'Authorization code missing. Please start the login flow from /auth/google.',
-      });
+      return res.redirect(`${process.env.FRONTEND_URL}/auth/callback?error=missing_code`);
     }
 
     if (!verifier) {
-      return res.status(400).json({
-        success: false,
-        error: 'Code verifier missing. Your session may have timed out or cookies are blocked.',
-      });
+      return res.redirect(`${process.env.FRONTEND_URL}/auth/callback?error=missing_verifier`);
     }
 
     const tempSupabase = createClient(
@@ -207,12 +205,7 @@ export async function authCallback(req: Request, res: Response) {
     const { data, error } = await tempSupabase.auth.exchangeCodeForSession(code);
     if (error) throw error;
 
-    res.clearCookie('sb-code-verifier', {
-      httpOnly: true,
-      secure: true,
-      sameSite: 'none',
-      path: '/',
-    });
+    res.clearCookie('sb-code-verifier', cookieOptions);
 
 
     const { data: profile } = await supabase
@@ -229,30 +222,20 @@ export async function authCallback(req: Request, res: Response) {
 
 
     res.cookie('access_token', data.session.access_token, {
-      httpOnly: true,
-      secure: true,
-      sameSite: 'none',
+      ...cookieOptions,
       maxAge: 60 * 60 * 24 * 7 * 1000,
-      path: '/',
     });
 
-    return res.status(200).json({
-      success: true,
-      message: 'Logged in successfully with Google',
-      data: {
-        user: {
-          id: data.user.id,
-          email: data.user.email,
-          full_name: full_name,
-          plan: profile?.plan ?? 'free',
-          onboarding_completed: profile?.onboarding_completed ?? false,
-        },
-      },
+    res.cookie('refresh_token', data.session.refresh_token, {
+      ...cookieOptions,
+      maxAge: 60 * 60 * 24 * 30 * 1000, // 30 days
     });
+
+    return res.redirect(`${process.env.FRONTEND_URL}/auth/callback?status=success`);
 
   } catch (err: any) {
     console.error('OAuth Callback error:', err);
-    return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
+    return res.redirect(`${process.env.FRONTEND_URL}/auth/callback?error=server_error`);
   }
 }
 
