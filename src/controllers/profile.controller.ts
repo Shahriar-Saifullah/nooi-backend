@@ -69,3 +69,30 @@ export async function updateProfile(req: AuthRequest, res: Response) {
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }
+
+export async function dismissPlanBanner(req: AuthRequest, res: Response) {
+  try {
+    const userId = req.user!.id;
+
+    const { error } = await supabase
+      .from('profiles')
+      .update({
+        plan_banner_dismissed: true,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', userId);
+
+    if (error) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Banner dismissed successfully.',
+    });
+
+  } catch (err) {
+    console.error('Dismiss banner error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}

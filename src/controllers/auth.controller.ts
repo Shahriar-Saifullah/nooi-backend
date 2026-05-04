@@ -246,7 +246,7 @@ export async function getMe(req: AuthRequest, res: Response) {
 
     const { data: profile, error } = await supabase
       .from('profiles')
-      .select('id, full_name, avatar_url, plan, onboarding_completed, language, created_at')
+      .select('id, full_name, avatar_url, plan, onboarding_completed, plan_banner_dismissed, language, created_at')
       .eq('id', userId)
       .single();
 
@@ -264,6 +264,7 @@ export async function getMe(req: AuthRequest, res: Response) {
           avatar_url: profile.avatar_url,
           plan: profile.plan,
           onboarding_completed: profile.onboarding_completed,
+          plan_banner_dismissed: profile.plan_banner_dismissed,  
           language: profile.language ?? 'en',
         },
       },
