@@ -12,12 +12,12 @@ export async function createProject(req: AuthRequest, res: Response) {
     const { data, error } = await supabase
       .from('projects')
       .insert({
-        user_id:        userId,
+        user_id: userId,
         name,
         floor_plan_data: floor_plan_data ?? {},
-        room_data:       room_data ?? {},
-        thumbnail_url:   thumbnail_url ?? null,
-        status:          'draft',
+        room_data: room_data ?? {},
+        thumbnail_url: thumbnail_url ?? null,
+        status: 'draft',
       })
       .select()
       .single();
@@ -42,11 +42,17 @@ export async function getProjects(req: AuthRequest, res: Response) {
   try {
     const userId = req.user!.id;
 
-    const { data, error } = await supabase
+    const limit = req.query.limit ? parseInt(req.query.limit as string) : undefined;
+
+    const query = supabase
       .from('projects')
       .select('id, name, thumbnail_url, status, created_at, updated_at')
       .eq('user_id', userId)
       .order('updated_at', { ascending: false });
+
+    if (limit) query.limit(limit);
+
+    const { data, error } = await query;
 
     if (error) {
       return res.status(400).json({ success: false, error: error.message });
@@ -66,7 +72,7 @@ export async function getProjects(req: AuthRequest, res: Response) {
 
 export async function getProject(req: AuthRequest, res: Response) {
   try {
-    const userId    = req.user!.id;
+    const userId = req.user!.id;
     const projectId = req.params.id;
 
     const { data, error } = await supabase
@@ -94,9 +100,9 @@ export async function getProject(req: AuthRequest, res: Response) {
 
 export async function updateProject(req: AuthRequest, res: Response) {
   try {
-    const userId    = req.user!.id;
+    const userId = req.user!.id;
     const projectId = req.params.id;
-    const updates   = req.body as UpdateProjectInput;
+    const updates = req.body as UpdateProjectInput;
 
     // Check project belongs to user
     const { data: existing } = await supabase
@@ -139,7 +145,7 @@ export async function updateProject(req: AuthRequest, res: Response) {
 
 export async function deleteProject(req: AuthRequest, res: Response) {
   try {
-    const userId    = req.user!.id;
+    const userId = req.user!.id;
     const projectId = req.params.id;
 
     const { data: existing } = await supabase
