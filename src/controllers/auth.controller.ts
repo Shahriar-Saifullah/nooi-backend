@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { supabase } from '../services/supabase';
+import { supabase, supabaseAuth } from '../services/supabase';
 import {
   SignupInput,
   LoginInput,
@@ -281,7 +281,7 @@ export async function resendVerification(req: Request, res: Response) {
   try {
     const { email } = req.body as ResendVerificationInput;
 
-    const { error } = await supabase.auth.resend({
+    const { error } = await supabaseAuth.auth.resend({
       type: 'signup',
       email,
       options: { emailRedirectTo: process.env.EMAIL_VERIFY_REDIRECT_URL },
@@ -307,14 +307,13 @@ export async function forgotPassword(req: Request, res: Response) {
   try {
     const { email } = req.body as ForgotPasswordInput;
 
-    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+    const { error } = await supabaseAuth.auth.resetPasswordForEmail(email, {
       redirectTo: process.env.PASSWORD_RESET_REDIRECT_URL,
     });
 
     if (error) {
       return res.status(400).json({ success: false, error: error.message });
     }
-
 
     return res.status(200).json({
       success: true,
