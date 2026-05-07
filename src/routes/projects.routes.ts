@@ -1,12 +1,21 @@
 import { Router } from 'express';
-import { requireAuth } from '../middleware/auth.middleware';
+import {
+  createProject,
+  getProjects,
+  getProject,
+  updateProject,
+  deleteProject,
+} from '../controllers/project.controller';
+import { requireAuth }          from '../middleware/auth.middleware';
+import { validate }             from '../middleware/validate';
+import { createProjectSchema, updateProjectSchema } from '../schemas/project.schema';
+
 const router = Router();
 
-// Dev 1 will implement these
-router.get('/',       requireAuth, (req, res) => res.json({ message: 'list projects' }));
-router.post('/',      requireAuth, (req, res) => res.json({ message: 'create project' }));
-router.get('/:id',    requireAuth, (req, res) => res.json({ message: 'get project' }));
-router.put('/:id',    requireAuth, (req, res) => res.json({ message: 'update project' }));
-router.delete('/:id', requireAuth, (req, res) => res.json({ message: 'delete project' }));
+router.post('/',     requireAuth, validate(createProjectSchema), createProject);
+router.get('/',      requireAuth, getProjects);
+router.get('/:id',   requireAuth, getProject);
+router.put('/:id',   requireAuth, validate(updateProjectSchema), updateProject);
+router.delete('/:id',requireAuth, deleteProject);
 
 export default router;

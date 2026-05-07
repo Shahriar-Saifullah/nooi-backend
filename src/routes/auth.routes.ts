@@ -1,10 +1,27 @@
 import { Router } from 'express';
+import {
+  signup, login, logout, getMe, googleSignIn, authCallback,
+  forgotPassword, resetPassword, resendVerification, setSession,
+} from '../controllers/auth.controller';
+import { validate }     from '../middleware/validate';
+import { requireAuth }  from '../middleware/auth.middleware';
+import {
+  signupSchema, loginSchema,
+  forgotPasswordSchema, resetPasswordSchema, resendVerificationSchema,
+} from '../schemas/auth.schema';
+
 const router = Router();
 
-// Dev 1 will implement these
-router.post('/signup',  (req, res) => res.json({ message: 'signup - coming soon' }));
-router.post('/login',   (req, res) => res.json({ message: 'login - coming soon' }));
-router.post('/logout',  (req, res) => res.json({ message: 'logout - coming soon' }));
-router.get('/me',       (req, res) => res.json({ message: 'me - coming soon' }));
+router.get('/google',   googleSignIn);
+router.get('/callback', authCallback);
+
+router.post('/signup',  validate(signupSchema), signup);
+router.post('/login',   validate(loginSchema),  login);
+router.post('/logout',  requireAuth, logout);
+router.get('/me',       requireAuth, getMe);
+router.post('/forgot-password', validate(forgotPasswordSchema), forgotPassword);
+router.post('/reset-password',  validate(resetPasswordSchema), resetPassword);
+router.post('/resend-verification',  validate(resendVerificationSchema),  resendVerification);
+router.post('/set-session', setSession);
 
 export default router;
