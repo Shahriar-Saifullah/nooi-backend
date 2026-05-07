@@ -369,3 +369,54 @@ export async function resetPassword(req: Request, res: Response) {
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }
+
+export async function setSession(req: Request, res: Response) {
+  try {
+    const { access_token, refresh_token } = req.body;
+
+    if (!access_token || !refresh_token) {
+      return res.status(400).json({ success: false, error: 'Missing tokens' });
+    }
+
+    // Verify the token is valid
+    const { data: { user }, error } = await supabase.auth.getUser(access_token);
+
+    if (error || !user) {
+      return res.status(401).json({ success: false, error: 'Invalid token' });
+    }
+
+    // Get profile
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('full_name, plan, onboarding_completed')
+      .eq('id', user.id)
+      .single();
+
+    // Set cookies
+    res.cookie('access_token', access_token, {
+      ...cookieOptions,
+      maxAge: 60 * 60 * 24 * 7 * 1000,
+    });
+
+    res.cookie('refresh_token', refresh_token, {
+      ...cookieOptions,
+      maxAge: 60 * 60 * 24 * 30 * 1000,
+    });
+
+    return res.status(200).json({
+      success: true,
+      user: {
+        id: user.id,
+        email: user.email,
+        onboarding_completed: profile?.onboarding_completed ?? false,
+      },
+    });
+
+  } catch (err) {
+    console.error('Set session error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+
+////asdasdasdasdasdasdasdas

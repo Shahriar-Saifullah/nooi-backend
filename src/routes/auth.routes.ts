@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import {
   signup, login, logout, getMe, googleSignIn, authCallback,
-  forgotPassword, resetPassword, resendVerification,
+  forgotPassword, resetPassword, resendVerification, setSession,
 } from '../controllers/auth.controller';
 import { validate }     from '../middleware/validate';
 import { requireAuth }  from '../middleware/auth.middleware';
@@ -22,5 +22,6 @@ router.get('/me',       requireAuth, getMe);
 router.post('/forgot-password', validate(forgotPasswordSchema), forgotPassword);
 router.post('/reset-password',  validate(resetPasswordSchema), resetPassword);
 router.post('/resend-verification',  validate(resendVerificationSchema),  resendVerification);
+router.post('/set-session', setSession);
 
 export default router;
