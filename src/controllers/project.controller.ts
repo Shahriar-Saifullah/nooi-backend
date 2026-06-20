@@ -51,31 +51,41 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
   const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash-lite' });
 
   const prompt = `
-    You are an expert architect analyzing a floor plan image.
-    Detect all rooms visible in this floor plan.
-    
+    You are an expert architect analyzing a floor plan image or drawing.
+    Detect all distinct rooms/spaces visible in this floor plan.
+
     Return ONLY a valid JSON array. No markdown, no explanation, no code blocks.
-    
+
     Each room object must have exactly these fields:
-    - "name": string (e.g. "Living Room", "Kitchen", "Bedroom 1", "Master Bedroom", "Bathroom", "Hallway", "Storage", "Dining Room", "Study", "Balcony")
-    - "confidence": number between 0 and 100 (how confident you are)
+    - "name": string — a clear, human-readable room name.
+      If there are multiple rooms of the same type (e.g. two bedrooms), 
+      number them distinctly: "Bedroom 1", "Bedroom 2", "Bathroom 1", "Bathroom 2", etc.
+      Use "Master Bedroom" only for the largest/primary bedroom (max once).
+      Common types: Living Room, Kitchen, Bedroom, Master Bedroom, Bathroom, 
+      Hallway, Storage, Dining Room, Study/Office, Balcony, Closet, Stairs, Garage, Entry.
+    - "confidence": number between 0 and 100 (how confident you are in this detection)
     - "color": string (a soft, distinct hex color for this room type — use pastel tones)
-    
-    Color guide (use these as reference):
+
+    Color guide (use these as reference, vary slightly for repeated room types):
     - Living Room: #c3f4f0
-    - Kitchen: #b9eac5  
+    - Kitchen: #b9eac5
     - Bedroom: #87ddd7
+    - Master Bedroom: #6dd0c4
     - Bathroom: #f7dfad
     - Hallway/Corridor: #d5dbda
-    - Storage/Utility: #ffc9c0
+    - Storage/Utility/Closet: #ffc9c0
     - Dining Room: #c7d2fe
     - Study/Office: #fde68a
     - Balcony/Terrace: #a7f3d0
+    - Stairs: #e0c3fc
     - Other: #e5e7eb
-    
+
+    IMPORTANT: Every room name in the output array must be unique. 
+    Never output the same name twice — always number duplicates (Bedroom 1, Bedroom 2...).
+
     Example output format:
-    [{"name":"Living Room","confidence":95,"color":"#c3f4f0"},{"name":"Kitchen","confidence":90,"color":"#b9eac5"}]
-    
+    [{"name":"Living Room","confidence":95,"color":"#c3f4f0"},{"name":"Bedroom 1","confidence":90,"color":"#87ddd7"},{"name":"Bedroom 2","confidence":88,"color":"#87ddd7"}]
+
     Only return the JSON array. Nothing else at all.
   `;
 
@@ -110,13 +120,32 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
 
   const parsed: Array<{ name: string; confidence: number; color: string }> = JSON.parse(cleaned);
 
-  // Map to Room format with projectId-prefixed IDs
-  return parsed.map((room, index) => ({
-    id:         `${projectId}-r${index + 1}`,
-    name:       room.name,
-    confidence: Math.min(100, Math.max(0, Math.round(room.confidence))),
-    color:      room.color || '#e5e7eb',
-  }));
+  // Safety net: auto-number any duplicate names Gemini might still produce
+  const nameCounts = new Map<string, number>();
+  const totalCounts = new Map<string, number>();
+  for (const room of parsed) {
+    totalCounts.set(room.name, (totalCounts.get(room.name) || 0) + 1);
+  }
+
+  return parsed.map((room, index) => {
+    let displayName = room.name;
+    const total = totalCounts.get(room.name) || 1;
+    if (total > 1) {
+      const seen = (nameCounts.get(room.name) || 0) + 1;
+      nameCounts.set(room.name, seen);
+      // Don't double-number names that already end in a digit (e.g. "Bedroom 2")
+      if (!/\d+$/.test(room.name.trim())) {
+        displayName = `${room.name} ${seen}`;
+      }
+    }
+
+    return {
+      id:         `${projectId}-r${index + 1}`,
+      name:       displayName,
+      confidence: Math.min(100, Math.max(0, Math.round(room.confidence))),
+      color:      room.color || '#e5e7eb',
+    };
+  });
 }
 
 // ─── Step 1: Create project ───────────────────────────────────────────────────
