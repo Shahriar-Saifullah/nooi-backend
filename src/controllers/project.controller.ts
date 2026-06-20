@@ -1,7 +1,7 @@
 import { Response } from 'express';
-import { Request as MulterRequest } from 'express';
 import { supabase } from '../services/supabase';
 import { AuthRequest } from '../types';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import {
   CreateProjectInput,
   SaveRoomsInput,
@@ -10,7 +10,7 @@ import {
   Room,
 } from '../schemas/project.schema';
 
-// Multer file type (avoids Express.Multer namespace issue)
+// ─── Multer file type ─────────────────────────────────────────────────────────
 
 interface UploadedFile {
   fieldname: string;
@@ -20,7 +20,7 @@ interface UploadedFile {
   buffer: Buffer;
 }
 
-// Helper 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function computeTotalArea(rooms: Room[]): number {
   return parseFloat(
@@ -41,16 +41,93 @@ async function verifyOwnership(projectId: string, userId: string) {
   return data;
 }
 
-// Create project 
+// ─── Gemini Vision — Real room detection ─────────────────────────────────────
+
+async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Room[]> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not set');
+
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+
+  const prompt = `
+    You are an expert architect analyzing a floor plan image.
+    Detect all rooms visible in this floor plan.
+    
+    Return ONLY a valid JSON array. No markdown, no explanation, no code blocks.
+    
+    Each room object must have exactly these fields:
+    - "name": string (e.g. "Living Room", "Kitchen", "Bedroom 1", "Master Bedroom", "Bathroom", "Hallway", "Storage", "Dining Room", "Study", "Balcony")
+    - "confidence": number between 0 and 100 (how confident you are)
+    - "color": string (a soft, distinct hex color for this room type — use pastel tones)
+    
+    Color guide (use these as reference):
+    - Living Room: #c3f4f0
+    - Kitchen: #b9eac5  
+    - Bedroom: #87ddd7
+    - Bathroom: #f7dfad
+    - Hallway/Corridor: #d5dbda
+    - Storage/Utility: #ffc9c0
+    - Dining Room: #c7d2fe
+    - Study/Office: #fde68a
+    - Balcony/Terrace: #a7f3d0
+    - Other: #e5e7eb
+    
+    Example output format:
+    [{"name":"Living Room","confidence":95,"color":"#c3f4f0"},{"name":"Kitchen","confidence":90,"color":"#b9eac5"}]
+    
+    Only return the JSON array. Nothing else at all.
+  `;
+
+  // Fetch image and convert to base64
+  const imageResponse = await fetch(floorPlanUrl);
+  if (!imageResponse.ok) {
+    throw new Error(`Failed to fetch floor plan image: ${imageResponse.statusText}`);
+  }
+
+  const imageBuffer = await imageResponse.arrayBuffer();
+  const base64Image = Buffer.from(imageBuffer).toString('base64');
+  const mimeType = (imageResponse.headers.get('content-type') || 'image/png').split(';')[0];
+
+  const result = await model.generateContent([
+    { text: prompt },
+    {
+      inlineData: {
+        data: base64Image,
+        mimeType,
+      },
+    },
+  ]);
+
+  const rawText = result.response.text().trim();
+
+  // Strip any accidental markdown code blocks
+  const cleaned = rawText
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+
+  const parsed: Array<{ name: string; confidence: number; color: string }> = JSON.parse(cleaned);
+
+  // Map to Room format with projectId-prefixed IDs
+  return parsed.map((room, index) => ({
+    id:         `${projectId}-r${index + 1}`,
+    name:       room.name,
+    confidence: Math.min(100, Math.max(0, Math.round(room.confidence))),
+    color:      room.color || '#e5e7eb',
+  }));
+}
+
+// ─── Step 1: Create project ───────────────────────────────────────────────────
 // POST /projects
-// Body: { name, project_type, address? }
 
 export async function createProject(req: AuthRequest, res: Response) {
   try {
     const userId = req.user!.id;
     const { name, project_type, address } = req.body as CreateProjectInput;
 
-    
+    // Enforce plan project limits
     const { data: profile } = await supabase
       .from('profiles')
       .select('plan')
@@ -58,8 +135,8 @@ export async function createProject(req: AuthRequest, res: Response) {
       .single();
 
     const plan = profile?.plan ?? 'free';
-    const limits: Record<string, number> = { free: 3, starter: 10, pro: Infinity };
-    const limit = limits[plan] ?? 3;
+    const limits: Record<string, number> = { free: 50, starter: 10, pro: Infinity };
+    const limit = limits[plan] ?? 50;
 
     if (limit !== Infinity) {
       const { count } = await supabase
@@ -105,7 +182,7 @@ export async function createProject(req: AuthRequest, res: Response) {
   }
 }
 
-// Upload floor plan 
+// ─── Step 2: Upload floor plan ────────────────────────────────────────────────
 // POST /projects/:id/floor-plan  (multipart/form-data, field: floor_plan)
 
 export async function uploadFloorPlan(req: AuthRequest, res: Response) {
@@ -123,7 +200,7 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
       return res.status(400).json({ success: false, error: 'No file uploaded' });
     }
 
-
+    // Validate file type
     const allowed = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
     if (!allowed.includes(file.mimetype)) {
       return res.status(400).json({
@@ -133,7 +210,7 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
       });
     }
 
-   
+    // Validate size (20 MB)
     if (file.size > 20 * 1024 * 1024) {
       return res.status(400).json({
         success: false,
@@ -142,7 +219,7 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
       });
     }
 
-    
+    // Upload to Supabase Storage
     const ext         = file.originalname.split('.').pop();
     const storagePath = `floor-plans/${userId}/${projectId}.${ext}`;
 
@@ -161,7 +238,7 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
       .from('nooi-projects')
       .getPublicUrl(storagePath);
 
-    
+    // Save floor plan URL on project
     const { data: updated, error: updateError } = await supabase
       .from('projects')
       .update({
@@ -182,7 +259,15 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
       return res.status(400).json({ success: false, error: updateError.message });
     }
 
-    const detectedRooms = await detectRooms(publicUrl, projectId);
+    // Detect rooms using Gemini Vision
+    let detectedRooms: Room[] = [];
+    try {
+      detectedRooms = await detectRooms(publicUrl, projectId);
+    } catch (aiErr) {
+      // AI detection failed — return empty rooms, user can add manually
+      console.error('Gemini room detection failed:', aiErr);
+      detectedRooms = [];
+    }
 
     return res.status(200).json({
       success: true,
@@ -190,6 +275,7 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
         project:        updated,
         floor_plan_url: publicUrl,
         detected_rooms: detectedRooms,
+        ai_detected:    detectedRooms.length > 0,
       },
     });
 
@@ -199,62 +285,7 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
   }
 }
 
-// Step 2b: Use sample floor plan 
-// POST /projects/:id/floor-plan/sample
-
-export async function useSampleFloorPlan(req: AuthRequest, res: Response) {
-  try {
-    const userId    = req.user!.id;
-    const projectId = String(req.params.id);
-
-    const project = await verifyOwnership(projectId, userId);
-    if (!project) {
-      return res.status(404).json({ success: false, error: 'Project not found' });
-    }
-
-    const sampleUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/nooi-projects/samples/sample-floor-plan.png`;
-
-    await supabase
-      .from('projects')
-      .update({
-        floor_plan_url:  sampleUrl,
-        floor_plan_data: { is_sample: true },
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', projectId);
-
-    const detectedRooms = await detectRooms(sampleUrl, projectId);
-
-    return res.status(200).json({
-      success: true,
-      data: {
-        floor_plan_url: sampleUrl,
-        detected_rooms: detectedRooms,
-        is_sample:      true,
-      },
-    });
-
-  } catch (err) {
-    console.error('Sample floor plan error:', err);
-    return res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-}
-
-// AI room detection stub 
-// TODO: replace with real AI call when ready
-
-async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Room[]> {
-  return [
-    { id: `${projectId}-r1`, name: 'Living room', color: '#a8d8cb', confidence: 97 },
-    { id: `${projectId}-r2`, name: 'Kitchen',     color: '#a8d8cb', confidence: 93 },
-    { id: `${projectId}-r3`, name: 'Bedroom 1',   color: '#7ecec0', confidence: 88 },
-    { id: `${projectId}-r4`, name: 'Bathroom',    color: '#f5d99a', confidence: 91 },
-    { id: `${projectId}-r5`, name: 'Hallway',     color: '#c8c8c8', confidence: 79 },
-    { id: `${projectId}-r6`, name: 'Storage',     color: '#f5bfbf', confidence: 72 },
-  ];
-}
-
-// Step 3: Save reviewed rooms 
+// ─── Step 3: Save reviewed rooms ──────────────────────────────────────────────
 // PUT /projects/:id/rooms
 
 export async function saveRooms(req: AuthRequest, res: Response) {
@@ -293,7 +324,7 @@ export async function saveRooms(req: AuthRequest, res: Response) {
   }
 }
 
-// Step 4: Save room dimensions 
+// ─── Step 4: Save room dimensions ─────────────────────────────────────────────
 // PUT /projects/:id/dimensions
 
 export async function saveDimensions(req: AuthRequest, res: Response) {
@@ -342,7 +373,7 @@ export async function saveDimensions(req: AuthRequest, res: Response) {
   }
 }
 
-// Step 5: Confirm project 
+// ─── Step 5: Confirm project ──────────────────────────────────────────────────
 // POST /projects/:id/confirm
 
 export async function confirmProject(req: AuthRequest, res: Response) {
@@ -407,7 +438,7 @@ export async function confirmProject(req: AuthRequest, res: Response) {
   }
 }
 
-// Standard CRUD 
+// ─── Standard CRUD ────────────────────────────────────────────────────────────
 
 export async function getProjects(req: AuthRequest, res: Response) {
   try {
