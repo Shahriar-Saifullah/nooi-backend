@@ -48,7 +48,7 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set');
 
   const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash-lite' });
 
   const prompt = `
     You are an expert architect analyzing a floor plan image.
