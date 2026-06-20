@@ -2,6 +2,13 @@ import { z } from 'zod';
 
 // ─── Room ─────────────────────────────────────────────────────────────────────
 
+export const roomBoxSchema = z.object({
+  top:    z.number().min(0).max(100),
+  left:   z.number().min(0).max(100),
+  width:  z.number().min(0).max(100),
+  height: z.number().min(0).max(100),
+});
+
 export const roomSchema = z.object({
   id:         z.string(),
   name:       z.string().min(1),
@@ -10,11 +17,12 @@ export const roomSchema = z.object({
   length:     z.number().positive().optional(),
   width:      z.number().positive().optional(),
   height:     z.number().positive().optional(),
+  box:        roomBoxSchema.optional(), // position on the floor plan image, as % (top/left/width/height)
 });
 
 export type Room = z.infer<typeof roomSchema>;
 
-// Create project 
+// ─── Step 1 — Create project ──────────────────────────────────────────────────
 
 export const createProjectSchema = z.object({
   name: z.string()
@@ -29,7 +37,7 @@ export const createProjectSchema = z.object({
 
 export type CreateProjectInput = z.infer<typeof createProjectSchema>;
 
-// Save reviewed rooms 
+// ─── Step 3 — Save reviewed rooms ────────────────────────────────────────────
 
 export const saveRoomsSchema = z.object({
   project_id: z.string().uuid('Invalid project ID'),
@@ -38,7 +46,7 @@ export const saveRoomsSchema = z.object({
 
 export type SaveRoomsInput = z.infer<typeof saveRoomsSchema>;
 
-// Save room dimensions 
+// ─── Step 4 — Save room dimensions ───────────────────────────────────────────
 
 export const roomDimensionSchema = z.object({
   id:     z.string(),
@@ -54,7 +62,7 @@ export const saveDimensionsSchema = z.object({
 
 export type SaveDimensionsInput = z.infer<typeof saveDimensionsSchema>;
 
-// Update project 
+// ─── Update project ───────────────────────────────────────────────────────────
 
 export const updateProjectSchema = z.object({
   name:            z.string().min(1).max(100).optional(),

@@ -52,7 +52,7 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
 
   const prompt = `
     You are an expert architect analyzing a floor plan image or drawing.
-    Detect all distinct rooms/spaces visible in this floor plan.
+    Detect all distinct rooms/spaces visible in this floor plan, including their position.
 
     Return ONLY a valid JSON array. No markdown, no explanation, no code blocks.
 
@@ -65,6 +65,11 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
       Hallway, Storage, Dining Room, Study/Office, Balcony, Closet, Stairs, Garage, Entry.
     - "confidence": number between 0 and 100 (how confident you are in this detection)
     - "color": string (a soft, distinct hex color for this room type — use pastel tones)
+    - "box_2d": [ymin, xmin, ymax, xmax] — the bounding box of this room's floor area
+      within the image, normalized to a 0-1000 scale where [0,0] is the top-left corner
+      and [1000,1000] is the bottom-right corner of the entire image.
+      Be as precise as possible — the box should tightly outline just that room's floor space,
+      not the whole image and not overlapping unrelated rooms.
 
     Color guide (use these as reference, vary slightly for repeated room types):
     - Living Room: #c3f4f0
@@ -84,7 +89,7 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
     Never output the same name twice — always number duplicates (Bedroom 1, Bedroom 2...).
 
     Example output format:
-    [{"name":"Living Room","confidence":95,"color":"#c3f4f0"},{"name":"Bedroom 1","confidence":90,"color":"#87ddd7"},{"name":"Bedroom 2","confidence":88,"color":"#87ddd7"}]
+    [{"name":"Living Room","confidence":95,"color":"#c3f4f0","box_2d":[120,80,420,360]},{"name":"Bedroom 1","confidence":90,"color":"#87ddd7","box_2d":[50,400,300,700]}]
 
     Only return the JSON array. Nothing else at all.
   `;
@@ -118,7 +123,12 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
     .replace(/\s*```$/i, '')
     .trim();
 
-  const parsed: Array<{ name: string; confidence: number; color: string }> = JSON.parse(cleaned);
+  const parsed: Array<{
+    name: string;
+    confidence: number;
+    color: string;
+    box_2d?: [number, number, number, number];
+  }> = JSON.parse(cleaned);
 
   // Safety net: auto-number any duplicate names Gemini might still produce
   const nameCounts = new Map<string, number>();
@@ -139,11 +149,24 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
       }
     }
 
+    // Convert Gemini's [ymin, xmin, ymax, xmax] (0-1000 scale) to a percentage box
+    let box: Room['box'] = undefined;
+    if (Array.isArray(room.box_2d) && room.box_2d.length === 4) {
+      const [ymin, xmin, ymax, xmax] = room.box_2d;
+      box = {
+        top:    Math.max(0, Math.min(100, ymin / 10)),
+        left:   Math.max(0, Math.min(100, xmin / 10)),
+        width:  Math.max(0, Math.min(100, (xmax - xmin) / 10)),
+        height: Math.max(0, Math.min(100, (ymax - ymin) / 10)),
+      };
+    }
+
     return {
       id:         `${projectId}-r${index + 1}`,
       name:       displayName,
       confidence: Math.min(100, Math.max(0, Math.round(room.confidence))),
       color:      room.color || '#e5e7eb',
+      box,
     };
   });
 }
