@@ -41,20 +41,30 @@ async function verifyOwnership(projectId: string, userId: string) {
   return data;
 }
 
-// ─── Gemini Vision — Real room detection ─────────────────────────────────────
+// ─── Gemini Vision — Real room detection (two-pass) ──────────────────────────
 
-async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Room[]> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('GEMINI_API_KEY is not set');
+interface RawRoom {
+  name: string;
+  confidence: number;
+  color: string;
+  box_2d?: [number, number, number, number];
+  dimensions?: { length: number; width: number; unit: 'ft' | 'm' } | null;
+}
 
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({
-    model: 'gemini-2.5-flash-lite',
-    generationConfig: {
-      responseMimeType: 'application/json',
-    },
-  });
+function stripJsonFences(text: string): string {
+  return text
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+}
 
+// Pass 1 — detect all rooms with names, colors, dimensions, and a first-guess box
+async function detectRoomsPass1(
+  model: ReturnType<GoogleGenerativeAI['getGenerativeModel']>,
+  base64Image: string,
+  mimeType: string
+): Promise<RawRoom[]> {
   const prompt = `
     You are an expert architect analyzing a floor plan image or drawing.
     Detect all distinct rooms/spaces visible in this floor plan.
@@ -74,18 +84,11 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
 
     - "color": string (a soft, distinct hex color for this room type — use pastel tones)
 
-    - "box_2d": [ymin, xmin, ymax, xmax] — the TIGHT bounding box of this room's full floor area,
-      normalized to a 0-1000 scale where [0,0] is the top-left corner of the entire image
-      and [1000,1000] is the bottom-right corner.
-      CRITICAL ACCURACY RULES:
-      * The box MUST extend to the actual wall lines / boundary of the room on all four sides —
-        do not shrink it to only cover the room's text label. The label is usually in the
-        center of a much larger room area; the box must cover the ENTIRE room footprint,
-        wall to wall, not just the text.
-      * For irregularly shaped or L-shaped rooms, use the bounding box that best covers the
-        full visible room outline.
-      * Do not let boxes overlap with neighboring rooms beyond shared walls.
-      * Double check each box against the actual drawn room outline before finalizing.
+    - "box_2d": [ymin, xmin, ymax, xmax] — your BEST FIRST ESTIMATE of this room's full
+      floor area bounding box, normalized to a 0-1000 scale where [0,0] is the top-left
+      corner of the entire image and [1000,1000] is the bottom-right corner.
+      The box should extend to the room's actual wall lines, not just its text label.
+      This will be refined in a second pass, so a reasonable estimate is fine here.
 
     - "dimensions": object or null — if the floor plan image has printed text showing this
       room's measurements (e.g. "14'-7\\" X 16'", "20'8\\" X 17'", "12' X 24'", or metric
@@ -117,42 +120,81 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
     Only return the JSON array. Nothing else at all.
   `;
 
-  // Fetch image and convert to base64
+  const result = await model.generateContent([
+    { text: prompt },
+    { inlineData: { data: base64Image, mimeType } },
+  ]);
+
+  return JSON.parse(stripJsonFences(result.response.text().trim()));
+}
+
+// Pass 2 — re-examine the same full image, but ask Gemini to tighten ONE room's box
+// against the real wall boundaries, now that it already knows the floor plan layout.
+async function refineRoomBox(
+  model: ReturnType<GoogleGenerativeAI['getGenerativeModel']>,
+  base64Image: string,
+  mimeType: string,
+  room: RawRoom
+): Promise<[number, number, number, number] | null> {
+  if (!room.box_2d) return null;
+
+  const prompt = `
+    Here is a floor plan image. A room called "${room.name}" was previously detected
+    with this approximate bounding box (0-1000 scale, [ymin, xmin, ymax, xmax]):
+    ${JSON.stringify(room.box_2d)}
+
+    Look very closely at the "${room.name}" area of this floor plan and give a CORRECTED,
+    tightly-fitted bounding box that extends exactly to that room's wall lines on all sides —
+    covering its entire floor footprint, not just the area near its text label.
+
+    Return ONLY a JSON object with this exact shape, nothing else:
+    {"box_2d":[ymin,xmin,ymax,xmax]}
+  `;
+
+  try {
+    const result = await model.generateContent([
+      { text: prompt },
+      { inlineData: { data: base64Image, mimeType } },
+    ]);
+    const parsed = JSON.parse(stripJsonFences(result.response.text().trim()));
+    if (Array.isArray(parsed.box_2d) && parsed.box_2d.length === 4) {
+      return parsed.box_2d as [number, number, number, number];
+    }
+    return null;
+  } catch {
+    // If refinement fails for this room, fall back to the pass-1 box silently
+    return null;
+  }
+}
+
+async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Room[]> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not set');
+
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({
+    model: 'gemini-2.5-flash',
+    generationConfig: {
+      responseMimeType: 'application/json',
+    },
+  });
+
+  // Fetch image and convert to base64 (shared across both passes)
   const imageResponse = await fetch(floorPlanUrl);
   if (!imageResponse.ok) {
     throw new Error(`Failed to fetch floor plan image: ${imageResponse.statusText}`);
   }
-
   const imageBuffer = await imageResponse.arrayBuffer();
   const base64Image = Buffer.from(imageBuffer).toString('base64');
   const mimeType = (imageResponse.headers.get('content-type') || 'image/png').split(';')[0];
 
-  const result = await model.generateContent([
-    { text: prompt },
-    {
-      inlineData: {
-        data: base64Image,
-        mimeType,
-      },
-    },
-  ]);
+  // ── Pass 1: detect all rooms ──
+  const parsed = await detectRoomsPass1(model, base64Image, mimeType);
 
-  const rawText = result.response.text().trim();
-
-  // Strip any accidental markdown code blocks (safety net even with JSON mode)
-  const cleaned = rawText
-    .replace(/^```json\s*/i, '')
-    .replace(/^```\s*/i, '')
-    .replace(/\s*```$/i, '')
-    .trim();
-
-  const parsed: Array<{
-    name: string;
-    confidence: number;
-    color: string;
-    box_2d?: [number, number, number, number];
-    dimensions?: { length: number; width: number; unit: 'ft' | 'm' } | null;
-  }> = JSON.parse(cleaned);
+  // ── Pass 2: refine each room's box in parallel ──
+  const refinedBoxes = await Promise.all(
+    parsed.map(room => refineRoomBox(model, base64Image, mimeType, room))
+  );
 
   const FT_TO_M = 0.3048;
 
@@ -175,10 +217,12 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
       }
     }
 
-    // Convert Gemini's [ymin, xmin, ymax, xmax] (0-1000 scale) to a percentage box
+    // Use the refined box from pass 2 if available, otherwise fall back to pass 1's box
+    const finalBox2d = refinedBoxes[index] || room.box_2d;
+
     let box: Room['box'] = undefined;
-    if (Array.isArray(room.box_2d) && room.box_2d.length === 4) {
-      const [ymin, xmin, ymax, xmax] = room.box_2d;
+    if (Array.isArray(finalBox2d) && finalBox2d.length === 4) {
+      const [ymin, xmin, ymax, xmax] = finalBox2d;
       box = {
         top:    Math.max(0, Math.min(100, ymin / 10)),
         left:   Math.max(0, Math.min(100, xmin / 10)),
