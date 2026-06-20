@@ -48,28 +48,51 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set');
 
   const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash-lite' });
+  const model = genAI.getGenerativeModel({
+    model: 'gemini-2.5-flash-lite',
+    generationConfig: {
+      responseMimeType: 'application/json',
+    },
+  });
 
   const prompt = `
     You are an expert architect analyzing a floor plan image or drawing.
-    Detect all distinct rooms/spaces visible in this floor plan, including their position.
+    Detect all distinct rooms/spaces visible in this floor plan.
 
     Return ONLY a valid JSON array. No markdown, no explanation, no code blocks.
 
     Each room object must have exactly these fields:
+
     - "name": string — a clear, human-readable room name.
-      If there are multiple rooms of the same type (e.g. two bedrooms), 
+      If there are multiple rooms of the same type (e.g. two bedrooms),
       number them distinctly: "Bedroom 1", "Bedroom 2", "Bathroom 1", "Bathroom 2", etc.
       Use "Master Bedroom" only for the largest/primary bedroom (max once).
-      Common types: Living Room, Kitchen, Bedroom, Master Bedroom, Bathroom, 
-      Hallway, Storage, Dining Room, Study/Office, Balcony, Closet, Stairs, Garage, Entry.
+      Common types: Living Room, Kitchen, Bedroom, Master Bedroom, Bathroom,
+      Hallway, Storage, Dining Room, Study/Office, Balcony, Closet, Stairs, Garage, Entry, Porch, Patio.
+
     - "confidence": number between 0 and 100 (how confident you are in this detection)
+
     - "color": string (a soft, distinct hex color for this room type — use pastel tones)
-    - "box_2d": [ymin, xmin, ymax, xmax] — the bounding box of this room's floor area
-      within the image, normalized to a 0-1000 scale where [0,0] is the top-left corner
-      and [1000,1000] is the bottom-right corner of the entire image.
-      Be as precise as possible — the box should tightly outline just that room's floor space,
-      not the whole image and not overlapping unrelated rooms.
+
+    - "box_2d": [ymin, xmin, ymax, xmax] — the TIGHT bounding box of this room's full floor area,
+      normalized to a 0-1000 scale where [0,0] is the top-left corner of the entire image
+      and [1000,1000] is the bottom-right corner.
+      CRITICAL ACCURACY RULES:
+      * The box MUST extend to the actual wall lines / boundary of the room on all four sides —
+        do not shrink it to only cover the room's text label. The label is usually in the
+        center of a much larger room area; the box must cover the ENTIRE room footprint,
+        wall to wall, not just the text.
+      * For irregularly shaped or L-shaped rooms, use the bounding box that best covers the
+        full visible room outline.
+      * Do not let boxes overlap with neighboring rooms beyond shared walls.
+      * Double check each box against the actual drawn room outline before finalizing.
+
+    - "dimensions": object or null — if the floor plan image has printed text showing this
+      room's measurements (e.g. "14'-7\\" X 16'", "20'8\\" X 17'", "12' X 24'", or metric
+      equivalents like "4.5m x 3.5m"), extract them here as:
+      { "length": number, "width": number, "unit": "ft" | "m" }
+      Convert feet-inches notation (e.g. 14'-7") to decimal feet (14.58).
+      If no dimension text is visible for a room, set "dimensions" to null — do not guess or invent numbers.
 
     Color guide (use these as reference, vary slightly for repeated room types):
     - Living Room: #c3f4f0
@@ -81,15 +104,15 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
     - Storage/Utility/Closet: #ffc9c0
     - Dining Room: #c7d2fe
     - Study/Office: #fde68a
-    - Balcony/Terrace: #a7f3d0
+    - Balcony/Terrace/Porch/Patio: #a7f3d0
     - Stairs: #e0c3fc
     - Other: #e5e7eb
 
-    IMPORTANT: Every room name in the output array must be unique. 
+    IMPORTANT: Every room name in the output array must be unique.
     Never output the same name twice — always number duplicates (Bedroom 1, Bedroom 2...).
 
     Example output format:
-    [{"name":"Living Room","confidence":95,"color":"#c3f4f0","box_2d":[120,80,420,360]},{"name":"Bedroom 1","confidence":90,"color":"#87ddd7","box_2d":[50,400,300,700]}]
+    [{"name":"Living Room","confidence":95,"color":"#c3f4f0","box_2d":[120,80,420,360],"dimensions":{"length":20.67,"width":17,"unit":"ft"}},{"name":"Porch","confidence":90,"color":"#a7f3d0","box_2d":[700,50,950,500],"dimensions":{"length":24,"width":12,"unit":"ft"}}]
 
     Only return the JSON array. Nothing else at all.
   `;
@@ -116,7 +139,7 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
 
   const rawText = result.response.text().trim();
 
-  // Strip any accidental markdown code blocks
+  // Strip any accidental markdown code blocks (safety net even with JSON mode)
   const cleaned = rawText
     .replace(/^```json\s*/i, '')
     .replace(/^```\s*/i, '')
@@ -128,7 +151,10 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
     confidence: number;
     color: string;
     box_2d?: [number, number, number, number];
+    dimensions?: { length: number; width: number; unit: 'ft' | 'm' } | null;
   }> = JSON.parse(cleaned);
+
+  const FT_TO_M = 0.3048;
 
   // Safety net: auto-number any duplicate names Gemini might still produce
   const nameCounts = new Map<string, number>();
@@ -161,12 +187,23 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
       };
     }
 
+    // Convert extracted dimensions to metres (Room schema stores length/width in metres)
+    let length: number | undefined;
+    let width: number | undefined;
+    if (room.dimensions && room.dimensions.length > 0 && room.dimensions.width > 0) {
+      const factor = room.dimensions.unit === 'ft' ? FT_TO_M : 1;
+      length = parseFloat((room.dimensions.length * factor).toFixed(2));
+      width  = parseFloat((room.dimensions.width * factor).toFixed(2));
+    }
+
     return {
       id:         `${projectId}-r${index + 1}`,
       name:       displayName,
       confidence: Math.min(100, Math.max(0, Math.round(room.confidence))),
       color:      room.color || '#e5e7eb',
       box,
+      length,
+      width,
     };
   });
 }
