@@ -92,3 +92,12 @@ export const updateProjectSchema = z.object({
 });
 
 export type UpdateProjectInput = z.infer<typeof updateProjectSchema>;
+
+// ─── Generate AI render (image) from a text prompt + current room layout ─────
+
+export const generateRenderSchema = z.object({
+  prompt: z.string().min(1, 'Prompt is required').max(2000),
+  model:  z.enum(['gemini', 'dalle', 'midjourney', 'flux', 'stable-diffusion'] as const).optional().default('gemini'),
+});
+
+export type GenerateRenderInput = z.infer<typeof generateRenderSchema>;
