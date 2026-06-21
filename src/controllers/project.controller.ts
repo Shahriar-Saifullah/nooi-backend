@@ -7,6 +7,7 @@ import {
   SaveRoomsInput,
   SaveDimensionsInput,
   UpdateProjectInput,
+  GenerateRenderInput,
   Room,
 } from '../schemas/project.schema';
 
@@ -671,6 +672,142 @@ export async function deleteProject(req: AuthRequest, res: Response) {
 
   } catch (err) {
     console.error('Delete project error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+// ─── Generate an AI render image from the user's prompt + current room layout ─
+// Every `model` value currently routes to the same Gemini image model
+// (gemini-2.5-flash-image, aka "Nano Banana") — see GenerateRenderInput schema
+// comment. Swapping in real per-provider routing later only touches this
+// function; the request/response contract for the frontend stays the same.
+
+function buildRoomContextSummary(rooms: Room[]): string {
+  if (!rooms || rooms.length === 0) return '';
+
+  const lines = rooms.map(r => {
+    const dims = (r.length && r.width) ? ` (${r.length}m x ${r.width}m)` : '';
+    return `- ${r.name}${dims}`;
+  });
+
+  return `The floor plan contains the following rooms:\n${lines.join('\n')}`;
+}
+
+interface GeminiImageResponse {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{
+        text?: string;
+        inlineData?: { data: string; mimeType: string };
+      }>;
+    };
+  }>;
+}
+
+async function callGeminiImageModel(prompt: string): Promise<{ base64: string; mimeType: string }> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not set');
+
+  // Using the raw REST endpoint here (rather than the @google/generative-ai
+  // SDK used elsewhere in this file) since image generation via
+  // responseModalities is a newer capability and the REST contract is the
+  // most stable reference for it — see ai.google.dev/gemini-api/docs/image-generation
+  const response = await fetch(
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent',
+    {
+      method:  'POST',
+      headers: {
+        'x-goog-api-key': apiKey,
+        'Content-Type':   'application/json',
+      },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Gemini image generation failed (${response.status}): ${errText}`);
+  }
+
+  const json = await response.json() as GeminiImageResponse;
+  const parts = json.candidates?.[0]?.content?.parts ?? [];
+  const imagePart = parts.find(p => p.inlineData?.data);
+
+  if (!imagePart || !imagePart.inlineData) {
+    throw new Error('Gemini did not return an image. It may have refused the prompt.');
+  }
+
+  return {
+    base64:   imagePart.inlineData.data,
+    mimeType: imagePart.inlineData.mimeType || 'image/png',
+  };
+}
+
+export async function generateRender(req: AuthRequest, res: Response) {
+  try {
+    const userId    = req.user!.id;
+    const projectId = String(req.params.id);
+    const { prompt, model } = req.body as GenerateRenderInput;
+
+    const project = await verifyOwnership(projectId, userId);
+    if (!project) {
+      return res.status(404).json({ success: false, error: 'Project not found' });
+    }
+
+    const rooms = (project.room_data as any)?.rooms ?? [];
+    const roomContext = buildRoomContextSummary(rooms);
+
+    const fullPrompt = [
+      'Generate a photorealistic interior design render based on this floor plan and the following request.',
+      roomContext,
+      `Design request: ${prompt}`,
+    ].filter(Boolean).join('\n\n');
+
+    let image: { base64: string; mimeType: string };
+    try {
+      image = await callGeminiImageModel(fullPrompt);
+    } catch (genErr: any) {
+      console.error('Image generation error:', genErr);
+      return res.status(502).json({
+        success: false,
+        error: genErr.message || 'Image generation failed. Please try again.',
+      });
+    }
+
+    // Upload the generated image to Supabase Storage, same bucket/convention
+    // used for uploaded floor plans, so renders persist and have a stable URL.
+    const ext = image.mimeType.split('/')[1] || 'png';
+    const storagePath = `renders/${userId}/${projectId}-${Date.now()}.${ext}`;
+    const buffer = Buffer.from(image.base64, 'base64');
+
+    const { error: uploadError } = await supabase.storage
+      .from('nooi-projects')
+      .upload(storagePath, buffer, {
+        contentType: image.mimeType,
+        upsert: true,
+      });
+
+    if (uploadError) {
+      return res.status(500).json({ success: false, error: uploadError.message });
+    }
+
+    const { data: { publicUrl } } = supabase.storage
+      .from('nooi-projects')
+      .getPublicUrl(storagePath);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        image_url: publicUrl,
+        model_requested: model, // echoed back; not yet used to pick a provider
+      },
+    });
+
+  } catch (err) {
+    console.error('Generate render error:', err);
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }
