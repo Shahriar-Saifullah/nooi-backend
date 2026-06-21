@@ -1,9 +1,33 @@
 import { Router } from 'express';
+import multer from 'multer';
+import rateLimit from 'express-rate-limit';
 import { requireAuth } from '../middleware/auth.middleware';
 import { getRecentGenerations } from '../controllers/generation.controller';
+import { generatePreview } from '../controllers/public-generation.controller';
 
 const router = Router();
 
+// Multer — memory storage, 20MB limit (matches the project floor-plan upload limit)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 20 * 1024 * 1024 },
+});
+
+// This endpoint is public (no requireAuth) since landing-page visitors don't
+// have an account yet — it hits a paid Gemini API with no auth gate, so it
+// gets its own stricter rate limit on top of the global one in index.ts.
+// 10 requests per IP per hour is a starting point; tune based on real abuse
+// patterns once this is live.
+const previewRateLimit = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    error: 'Too many preview requests from this device. Please try again later, or sign up for unlimited generations.',
+  },
+});
 
 const AI_TOOLS = [
   {
@@ -71,5 +95,10 @@ router.post('/suggest', requireAuth, (req, res) =>
 
 // GET /ai/generations/recent?limit=4
 router.get('/generations/recent', requireAuth, getRecentGenerations);
+
+// POST /ai/generate-preview — public, no auth, rate-limited. Used by the
+// landing page prompt box so visitors can generate a one-off design preview
+// before signing up. See public-generation.controller.ts for details.
+router.post('/generate-preview', previewRateLimit, upload.single('floor_plan'), generatePreview);
 
 export default router;
