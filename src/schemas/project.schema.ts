@@ -18,6 +18,10 @@ export const roomSchema = z.object({
   width:      z.number().positive().optional(),
   height:     z.number().positive().optional(),
   box:        roomBoxSchema.optional(), // position on the floor plan image, as % (top/left/width/height)
+  gridRow:    z.number().int().min(0).optional(),
+  gridCol:    z.number().int().min(0).optional(),
+  rowWeight:  z.number().positive().optional(),
+  colWeight:  z.number().positive().optional(),
 });
 
 export type Room = z.infer<typeof roomSchema>;
@@ -49,10 +53,22 @@ export type SaveRoomsInput = z.infer<typeof saveRoomsSchema>;
 // ─── Step 4 — Save room dimensions ───────────────────────────────────────────
 
 export const roomDimensionSchema = z.object({
-  id:     z.string(),
-  length: z.number().positive('Length must be positive'),
-  width:  z.number().positive('Width must be positive'),
-  height: z.number().positive('Height must be positive'),
+  id:         z.string(),
+  length:     z.number().positive('Length must be positive'),
+  width:      z.number().positive('Width must be positive'),
+  height:     z.number().positive('Height must be positive'),
+  // Layout fields are optional here (older clients may omit them), but when
+  // present they let the canvas page render the same interactive grid the
+  // user arranged during project creation, instead of falling back to a
+  // static, non-interactive image.
+  name:       z.string().optional(),
+  color:      z.string().optional(),
+  confidence: z.number().min(0).max(100).optional(),
+  box:        roomBoxSchema.optional(),
+  gridRow:    z.number().int().min(0).optional(),
+  gridCol:    z.number().int().min(0).optional(),
+  rowWeight:  z.number().positive().optional(),
+  colWeight:  z.number().positive().optional(),
 });
 
 export const saveDimensionsSchema = z.object({
