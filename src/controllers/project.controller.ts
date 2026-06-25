@@ -2,6 +2,7 @@ import { Response } from 'express';
 import { supabase } from '../services/supabase';
 import { AuthRequest } from '../types';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { saveGeneration } from './generation.controller';
 import {
   CreateProjectInput,
   SaveRoomsInput,
@@ -809,6 +810,10 @@ export async function generateRender(req: AuthRequest, res: Response) {
     const { data: { publicUrl } } = supabase.storage
       .from('nooi-projects')
       .getPublicUrl(storagePath);
+
+    // Persist the generation so it appears in the dashboard's Recent Creations.
+    // Fire-and-forget — non-fatal if it fails.
+    saveGeneration(userId, projectId, prompt, publicUrl, model ?? 'gemini', 'prompt-render');
 
     return res.status(200).json({
       success: true,
