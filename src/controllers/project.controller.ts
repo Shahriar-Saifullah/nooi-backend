@@ -2,6 +2,7 @@ import { Response } from 'express';
 import { supabase } from '../services/supabase';
 import { AuthRequest } from '../types';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { saveGeneration } from './generation.controller';
 import {
   CreateProjectInput,
   SaveRoomsInput,
@@ -704,9 +705,19 @@ interface GeminiImageResponse {
   }>;
 }
 
-async function callGeminiImageModel(prompt: string): Promise<{ base64: string; mimeType: string }> {
+export async function callGeminiImageModel(
+  prompt: string,
+  referenceImage?: { data: string; mimeType: string } | null
+): Promise<{ base64: string; mimeType: string }> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set');
+
+  const requestParts: Array<{ text: string } | { inlineData: { data: string; mimeType: string } }> = [
+    { text: prompt },
+  ];
+  if (referenceImage) {
+    requestParts.push({ inlineData: { data: referenceImage.data, mimeType: referenceImage.mimeType } });
+  }
 
   // Using the raw REST endpoint here (rather than the @google/generative-ai
   // SDK used elsewhere in this file) since image generation via
@@ -721,7 +732,7 @@ async function callGeminiImageModel(prompt: string): Promise<{ base64: string; m
         'Content-Type':   'application/json',
       },
       body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        contents: [{ role: 'user', parts: requestParts }],
         generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
       }),
     }
@@ -733,10 +744,12 @@ async function callGeminiImageModel(prompt: string): Promise<{ base64: string; m
   }
 
   const json = await response.json() as GeminiImageResponse;
-  const parts = json.candidates?.[0]?.content?.parts ?? [];
-  const imagePart = parts.find(p => p.inlineData?.data);
+  const responseParts = json.candidates?.[0]?.content?.parts ?? [];
+  const imagePart = responseParts.find(
+    (p): p is { inlineData: { data: string; mimeType: string } } => !!p.inlineData?.data
+  );
 
-  if (!imagePart || !imagePart.inlineData) {
+  if (!imagePart) {
     throw new Error('Gemini did not return an image. It may have refused the prompt.');
   }
 
@@ -797,6 +810,10 @@ export async function generateRender(req: AuthRequest, res: Response) {
     const { data: { publicUrl } } = supabase.storage
       .from('nooi-projects')
       .getPublicUrl(storagePath);
+
+    // Persist the generation so it appears in the dashboard's Recent Creations.
+    // Fire-and-forget — non-fatal if it fails.
+    saveGeneration(userId, projectId, prompt, publicUrl, model ?? 'gemini', 'prompt-render');
 
     return res.status(200).json({
       success: true,
