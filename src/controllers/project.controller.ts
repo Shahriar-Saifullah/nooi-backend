@@ -204,9 +204,71 @@ async function refineRoomBox(
   }
 }
 
+// Pass 3 — detect all doors and windows across the entire floor plan
+// Returns openings with position on the 0-1000 scale and which wall they sit on.
+interface RawOpening {
+  type: 'door' | 'window';
+  wall: 'horizontal' | 'vertical'; // orientation of the wall the opening is in
+  x: number;   // center x in 0-1000 scale
+  y: number;   // center y in 0-1000 scale
+  width: number; // opening width in 0-1000 scale units
+}
+
+async function detectOpenings(
+  model: ReturnType<GoogleGenerativeAI['getGenerativeModel']>,
+  base64Image: string,
+  mimeType: string
+): Promise<RawOpening[]> {
+  const prompt = `
+    You are an expert architect analyzing a floor plan image.
+    Detect ALL doors and windows visible in this floor plan.
+
+    Return ONLY a valid JSON array. No markdown, no explanation.
+
+    Each object must have exactly these fields:
+    - "type": "door" or "window"
+    - "wall": "horizontal" (wall runs left-right) or "vertical" (wall runs top-bottom)
+    - "x": number — center x position, normalized 0-1000 (0=left edge, 1000=right edge)
+    - "y": number — center y position, normalized 0-1000 (0=top edge, 1000=bottom edge)
+    - "width": number — opening width in the same 0-1000 scale (typical door: 30-60, window: 40-80)
+
+    Tips for detecting doors:
+    - Look for arc symbols (quarter-circle swing arcs) on walls
+    - Look for gaps in walls with a thin line across
+    - Typical door symbols: a line with an arc attached
+
+    Tips for detecting windows:
+    - Look for parallel lines crossing a wall (usually 3 lines close together)
+    - Windows sit in exterior walls
+
+    Example:
+    [{"type":"door","wall":"horizontal","x":250,"y":430,"width":40},{"type":"window","wall":"vertical","x":800,"y":200,"width":60}]
+
+    Return empty array [] if none found. Only return the JSON array.
+  `;
+
+  try {
+    const result = await model.generateContent([
+      { text: prompt },
+      { inlineData: { data: base64Image, mimeType } },
+    ]);
+    const rawText = result.response.text().trim();
+    console.log(`Pass 3 openings raw:`, rawText.slice(0, 300));
+    const parsed = JSON.parse(extractJson(rawText));
+    if (Array.isArray(parsed)) {
+      console.log(`Pass 3: detected ${parsed.length} openings`);
+      return parsed as RawOpening[];
+    }
+    return [];
+  } catch (err) {
+    console.error('Pass 3 openings failed:', err);
+    return [];
+  }
+}
+
 async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
   rooms: Room[];
-  building_perimeter?: [number, number][];
+  openings: RawOpening[];
 }> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set');
@@ -235,6 +297,9 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
   const refinedBoxes = await Promise.all(
     parsed.map(room => refineRoomBox(model, base64Image, mimeType, room))
   );
+
+  // ── Pass 3: detect doors and windows ──
+  const openings = await detectOpenings(model, base64Image, mimeType);
 
   const FT_TO_M = 0.3048;
 
@@ -291,7 +356,7 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
     };
   });
 
-  return { rooms: roomList };
+  return { rooms: roomList, openings };
 }
 
 // ─── Step 1: Create project ───────────────────────────────────────────────────
@@ -436,24 +501,23 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
 
     // Detect rooms using Gemini Vision
     let detectedRooms: Room[] = [];
-    let buildingPerimeter: [number, number][] | undefined;
+    let detectedOpenings: RawOpening[] = [];
     try {
       const detection = await detectRooms(publicUrl, projectId);
-      detectedRooms     = detection.rooms;
-      buildingPerimeter = detection.building_perimeter;
+      detectedRooms    = detection.rooms;
+      detectedOpenings = detection.openings;
     } catch (aiErr) {
       console.error('Gemini room detection failed:', aiErr);
       detectedRooms = [];
     }
 
-    // Persist detected rooms + building perimeter immediately
     if (detectedRooms.length > 0) {
       await supabase
         .from('projects')
         .update({
           room_data: {
-            rooms: detectedRooms,
-            ...(buildingPerimeter ? { building_perimeter: buildingPerimeter } : {}),
+            rooms:    detectedRooms,
+            openings: detectedOpenings,
           },
           updated_at: new Date().toISOString(),
         })
@@ -463,11 +527,11 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
     return res.status(200).json({
       success: true,
       data: {
-        project:           updated,
-        floor_plan_url:    publicUrl,
-        detected_rooms:    detectedRooms,
-        building_perimeter: buildingPerimeter,
-        ai_detected:       detectedRooms.length > 0,
+        project:        updated,
+        floor_plan_url: publicUrl,
+        detected_rooms: detectedRooms,
+        openings:       detectedOpenings,
+        ai_detected:    detectedRooms.length > 0,
       },
     });
 
