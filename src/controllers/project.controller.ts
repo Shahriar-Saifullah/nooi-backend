@@ -381,6 +381,8 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
   rooms: Room[];
   walls: Array<{ x1: number; y1: number; x2: number; y2: number; thickness: number }>;
   openings: RawOpening[];
+  imgW: number;
+  imgH: number;
 }> {
   const geminiKey = process.env.GEMINI_API_KEY;
   if (!geminiKey) throw new Error('GEMINI_API_KEY is not set');
@@ -417,8 +419,22 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
     console.error('Roboflow detection failed, falling back to Gemini only:', rfErr);
   }
 
-  // ── Step 2: Gemini — room naming and positioning ──
-  const parsed = await nameRoomsWithGemini(model, base64Image, mimeType, rfWalls, imgW, imgH);
+  // ── Step 2: Gemini — room naming (non-fatal if unavailable) ──
+  let parsed: RawRoom[] = [];
+  try {
+    parsed = await nameRoomsWithGemini(model, base64Image, mimeType, rfWalls, imgW, imgH);
+  } catch (geminiErr: any) {
+    console.error('Gemini room naming failed (will use Roboflow data only):', geminiErr.message || geminiErr);
+    // Retry once after 3 seconds
+    try {
+      await new Promise(r => setTimeout(r, 3000));
+      parsed = await nameRoomsWithGemini(model, base64Image, mimeType, rfWalls, imgW, imgH);
+      console.log('Gemini retry succeeded');
+    } catch (retryErr) {
+      console.error('Gemini retry also failed — proceeding with Roboflow data only');
+      parsed = [];
+    }
+  }
 
   // ── Step 3: Convert Roboflow walls to normalised wall segments ──
   // Roboflow returns bounding boxes for wall segments. We convert to line segments
@@ -512,7 +528,7 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
     };
   });
 
-  return { rooms: roomList, walls: wallSegments, openings };
+  return { rooms: roomList, walls: wallSegments, openings, imgW, imgH };
 }
 
 // ─── Step 1: Create project ───────────────────────────────────────────────────
@@ -659,11 +675,14 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
     let detectedRooms: Room[] = [];
     let detectedOpenings: RawOpening[] = [];
     let detectedWalls: Array<{ x1: number; y1: number; x2: number; y2: number; thickness: number }> = [];
+    let imgW = 1000; let imgH = 1000;
     try {
       const detection = await detectRooms(publicUrl, projectId);
       detectedRooms    = detection.rooms;
       detectedOpenings = detection.openings;
       detectedWalls    = detection.walls;
+      imgW             = detection.imgW;
+      imgH             = detection.imgH;
       console.log(`Detection complete: ${detectedRooms.length} rooms, ${detectedWalls.length} walls, ${detectedOpenings.length} openings`);
     } catch (aiErr) {
       console.error('Detection failed:', aiErr);
@@ -675,9 +694,10 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
         .from('projects')
         .update({
           room_data: {
-            rooms:    detectedRooms,
-            walls:    detectedWalls,
-            openings: detectedOpenings,
+            rooms:      detectedRooms,
+            walls:      detectedWalls,
+            openings:   detectedOpenings,
+            image_size: { width: imgW, height: imgH },
           },
           updated_at: new Date().toISOString(),
         })
@@ -716,10 +736,15 @@ export async function saveRooms(req: AuthRequest, res: Response) {
       return res.status(404).json({ success: false, error: 'Project not found' });
     }
 
+    // Preserve existing Roboflow data — only update rooms
+    const existing = (project.room_data as any) ?? {};
     const { data, error } = await supabase
       .from('projects')
       .update({
-        room_data:  { rooms },
+        room_data: {
+          ...existing,
+          rooms,
+        },
         updated_at: new Date().toISOString(),
       })
       .eq('id', projectId)
@@ -765,10 +790,16 @@ export async function saveDimensions(req: AuthRequest, res: Response) {
 
     const totalArea = computeTotalArea(mergedRooms);
 
+    // Preserve existing Roboflow data — only update rooms and total_area
+    const existing = (project.room_data as any) ?? {};
     const { data, error } = await supabase
       .from('projects')
       .update({
-        room_data:  { rooms: mergedRooms, total_area_m2: totalArea },
+        room_data: {
+          ...existing,
+          rooms: mergedRooms,
+          total_area_m2: totalArea,
+        },
         updated_at: new Date().toISOString(),
       })
       .eq('id', projectId)
