@@ -661,21 +661,23 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
     }
   });
 
-  // ── Step 4: Convert Roboflow doors/windows to openings ──
+  // ── Step 5: Convert Roboflow doors/windows to openings ──
   const openings: RawOpening[] = [
     ...rfDoors.map(d => ({
       type: 'door' as const,
       wall: (d.width > d.height ? 'horizontal' : 'vertical') as 'horizontal' | 'vertical',
       x: (d.x / imgW) * 1000,
       y: (d.y / imgH) * 1000,
-      width: (Math.max(d.width, d.height) / Math.max(imgW, imgH)) * 1000,
+      // Enforce minimum door width of 80 units (0-1000 scale) ≈ 0.8m real world
+      width: Math.max(80, (Math.max(d.width, d.height) / Math.max(imgW, imgH)) * 1000),
     })),
     ...rfWindows.map(w => ({
       type: 'window' as const,
       wall: (w.width > w.height ? 'horizontal' : 'vertical') as 'horizontal' | 'vertical',
       x: (w.x / imgW) * 1000,
       y: (w.y / imgH) * 1000,
-      width: (Math.max(w.width, w.height) / Math.max(imgW, imgH)) * 1000,
+      // Enforce minimum window width of 60 units ≈ 0.6m real world
+      width: Math.max(60, (Math.max(w.width, w.height) / Math.max(imgW, imgH)) * 1000),
     })),
   ];
 
