@@ -404,6 +404,19 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
       detectedRooms = [];
     }
 
+    // Persist detected rooms immediately so the canvas page can load them
+    // without requiring a separate saveRooms() call from the frontend.
+    // If detection failed we still write an empty array so room_data is never {}.
+    if (detectedRooms.length > 0) {
+      await supabase
+        .from('projects')
+        .update({
+          room_data:  { rooms: detectedRooms },
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', projectId);
+    }
+
     return res.status(200).json({
       success: true,
       data: {
