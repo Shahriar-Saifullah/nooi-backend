@@ -377,6 +377,70 @@ async function nameRoomsWithGemini(
   }
 }
 
+// ─── Fallback room generation from Roboflow wall clusters ─────────────────────
+// When Gemini is unavailable, cluster wall segments into approximate room regions
+// using a simple grid partition. Gives users generic room names so they can
+// proceed through the modal and rename manually.
+function generateFallbackRooms(
+  walls: RoboflowPrediction[],
+  doors: RoboflowPrediction[],
+  imgW: number,
+  imgH: number
+): RawRoom[] {
+  if (walls.length === 0) return [];
+
+  // Find wall extents
+  const allX = walls.flatMap(w => [w.x - w.width/2, w.x + w.width/2]);
+  const allY = walls.flatMap(w => [w.y - w.height/2, w.y + w.height/2]);
+  const minX = Math.min(...allX); const maxX = Math.max(...allX);
+  const minY = Math.min(...allY); const maxY = Math.max(...allY);
+
+  // Estimate number of rooms from door count (each door ≈ one room boundary)
+  const roomCount = Math.max(2, Math.min(doors.length + 1, 8));
+  const cols = roomCount <= 4 ? 2 : 3;
+  const rows = Math.ceil(roomCount / cols);
+
+  const ROOM_COLORS = [
+    '#c3f4f0','#b9eac5','#87ddd7','#6dd0c4',
+    '#f7dfad','#d5dbda','#ffc9c0','#c7d2fe',
+    '#fde68a','#a7f3d0','#e0c3fc','#e5e7eb',
+  ];
+
+  const ROOM_NAMES = [
+    'Living Room','Bedroom','Kitchen','Bathroom',
+    'Dining Room','Master Bedroom','Hallway','Study',
+    'Closet','Laundry','Porch','Storage',
+  ];
+
+  const rooms: RawRoom[] = [];
+  let idx = 0;
+
+  for (let r = 0; r < rows && idx < roomCount; r++) {
+    for (let c = 0; c < cols && idx < roomCount; c++) {
+      const cellW = (maxX - minX) / cols;
+      const cellH = (maxY - minY) / rows;
+      const x1 = minX + c * cellW;
+      const y1 = minY + r * cellH;
+      const x2 = x1 + cellW;
+      const y2 = y1 + cellH;
+
+      // Convert to 0-1000 scale
+      const toScale = (v: number, max: number) => Math.round((v / max) * 1000);
+      rooms.push({
+        name:       ROOM_NAMES[idx] || `Room ${idx + 1}`,
+        confidence: 60,
+        color:      ROOM_COLORS[idx % ROOM_COLORS.length],
+        box_2d:     [toScale(y1, imgH), toScale(x1, imgW), toScale(y2, imgH), toScale(x2, imgW)],
+        dimensions: null,
+      });
+      idx++;
+    }
+  }
+
+  console.log(`Fallback: generated ${rooms.length} placeholder rooms from wall data`);
+  return rooms;
+}
+
 async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
   rooms: Room[];
   walls: Array<{ x1: number; y1: number; x2: number; y2: number; thickness: number }>;
@@ -388,8 +452,9 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
   if (!geminiKey) throw new Error('GEMINI_API_KEY is not set');
 
   const genAI = new GoogleGenerativeAI(geminiKey);
+  // Use gemini-2.0-flash — more stable and less prone to 503 than 2.5-flash
   const model = genAI.getGenerativeModel({
-    model: 'gemini-2.5-flash',
+    model: 'gemini-2.0-flash',
     generationConfig: { responseMimeType: 'application/json' },
   });
 
@@ -431,8 +496,9 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
       parsed = await nameRoomsWithGemini(model, base64Image, mimeType, rfWalls, imgW, imgH);
       console.log('Gemini retry succeeded');
     } catch (retryErr) {
-      console.error('Gemini retry also failed — proceeding with Roboflow data only');
-      parsed = [];
+      console.error('Gemini retry also failed — generating rooms from Roboflow wall data');
+      // Generate placeholder rooms from wall clusters so user can still proceed
+      parsed = generateFallbackRooms(rfWalls, rfDoors, imgW, imgH);
     }
   }
 
