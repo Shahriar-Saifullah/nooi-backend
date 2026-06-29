@@ -266,44 +266,205 @@ async function detectOpenings(
   }
 }
 
+// ─── Roboflow floor plan detection ────────────────────────────────────────────
+// Uses CubiCasa5k-2 model to detect walls, doors, windows with precise coordinates
+
+interface RoboflowPrediction {
+  x: number;      // center x in pixels
+  y: number;      // center y in pixels
+  width: number;  // bounding box width in pixels
+  height: number; // bounding box height in pixels
+  class: 'wall' | 'door' | 'window';
+  confidence: number;
+}
+
+interface RoboflowResult {
+  predictions: RoboflowPrediction[];
+  image: { width: number; height: number };
+}
+
+async function detectWithRoboflow(imageUrl: string): Promise<{
+  walls: RoboflowPrediction[];
+  doors: RoboflowPrediction[];
+  windows: RoboflowPrediction[];
+  imageWidth: number;
+  imageHeight: number;
+}> {
+  const apiKey = process.env.ROBOFLOW_API_KEY;
+  if (!apiKey) throw new Error('ROBOFLOW_API_KEY is not set');
+
+  // Fetch image and convert to base64
+  const imgRes = await fetch(imageUrl);
+  if (!imgRes.ok) throw new Error(`Failed to fetch image: ${imgRes.statusText}`);
+  const imgBuffer = await imgRes.arrayBuffer();
+  const base64 = Buffer.from(imgBuffer).toString('base64');
+
+  // Call Roboflow serverless API
+  const response = await fetch(
+    `https://serverless.roboflow.com/cubicasa5k-2-qpmsa/6?api_key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: base64,
+    }
+  );
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Roboflow API error (${response.status}): ${err}`);
+  }
+
+  const result = await response.json() as RoboflowResult;
+  const predictions = result.predictions || [];
+
+  console.log(`Roboflow detected: ${predictions.length} elements on ${result.image.width}x${result.image.height}px image`);
+  predictions.forEach(p => console.log(`  ${p.class}: x=${p.x.toFixed(0)}, y=${p.y.toFixed(0)}, w=${p.width.toFixed(0)}, h=${p.height.toFixed(0)}, conf=${p.confidence.toFixed(2)}`));
+
+  return {
+    walls:       predictions.filter(p => p.class === 'wall'),
+    doors:       predictions.filter(p => p.class === 'door'),
+    windows:     predictions.filter(p => p.class === 'window'),
+    imageWidth:  result.image.width,
+    imageHeight: result.image.height,
+  };
+}
+
+// ─── Gemini room naming only ───────────────────────────────────────────────────
+// Given wall bounding boxes from Roboflow, ask Gemini to identify room types
+// and assign names + colors. This is what Gemini is actually good at.
+async function nameRoomsWithGemini(
+  model: ReturnType<GoogleGenerativeAI['getGenerativeModel']>,
+  base64Image: string,
+  mimeType: string,
+  walls: RoboflowPrediction[],
+  imageWidth: number,
+  imageHeight: number
+): Promise<RawRoom[]> {
+  // Compute room regions as gaps between walls (approximate room centers)
+  // We give Gemini the image and ask it only to name visible rooms, not position them
+  const prompt = `
+    You are an expert architect analyzing a floor plan image.
+    Detect all distinct rooms/spaces visible in this floor plan.
+
+    Return ONLY a valid JSON array. No markdown, no explanation, no code blocks.
+
+    Each room object must have exactly these fields:
+    - "name": string — clear human-readable room name (e.g. "Living Room", "Kitchen", "Master Bedroom")
+      Number duplicates: "Bedroom 1", "Bedroom 2", etc.
+    - "confidence": number 0-100
+    - "color": string — soft distinct hex pastel color for this room type
+    - "box_2d": [ymin, xmin, ymax, xmax] — approximate room bounding box, 0-1000 scale
+    - "dimensions": { "length": number, "width": number, "unit": "ft"|"m" } or null
+
+    Color guide:
+    - Living Room: #c3f4f0, Kitchen: #b9eac5, Bedroom: #87ddd7, Master Bedroom: #6dd0c4
+    - Bathroom: #f7dfad, Hallway: #d5dbda, Storage/Closet: #ffc9c0, Dining Room: #c7d2fe
+    - Study/Office: #fde68a, Balcony/Porch/Patio: #a7f3d0, Stairs: #e0c3fc, Other: #e5e7eb
+
+    Every room name must be unique. Only return the JSON array.
+  `;
+
+  const rawText = (await model.generateContent([
+    { text: prompt },
+    { inlineData: { data: base64Image, mimeType } },
+  ])).response.text().trim();
+
+  try {
+    return JSON.parse(extractJson(rawText));
+  } catch {
+    console.error('Room naming parse failed:', rawText.slice(0, 300));
+    return [];
+  }
+}
+
 async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
   rooms: Room[];
+  walls: Array<{ x1: number; y1: number; x2: number; y2: number; thickness: number }>;
   openings: RawOpening[];
 }> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('GEMINI_API_KEY is not set');
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!geminiKey) throw new Error('GEMINI_API_KEY is not set');
 
-  const genAI = new GoogleGenerativeAI(apiKey);
+  const genAI = new GoogleGenerativeAI(geminiKey);
   const model = genAI.getGenerativeModel({
     model: 'gemini-2.5-flash',
-    generationConfig: {
-      responseMimeType: 'application/json',
-    },
+    generationConfig: { responseMimeType: 'application/json' },
   });
 
-  // Fetch image and convert to base64 (shared across both passes)
+  // Fetch image once — shared across Roboflow and Gemini
   const imageResponse = await fetch(floorPlanUrl);
-  if (!imageResponse.ok) {
-    throw new Error(`Failed to fetch floor plan image: ${imageResponse.statusText}`);
-  }
+  if (!imageResponse.ok) throw new Error(`Failed to fetch floor plan image: ${imageResponse.statusText}`);
   const imageBuffer = await imageResponse.arrayBuffer();
   const base64Image = Buffer.from(imageBuffer).toString('base64');
   const mimeType = (imageResponse.headers.get('content-type') || 'image/png').split(';')[0];
 
-  // ── Pass 1: detect all rooms ──
-  const parsed = await detectRoomsPass1(model, base64Image, mimeType);
+  // ── Step 1: Roboflow — precise wall/door/window detection ──
+  let rfWalls: RoboflowPrediction[] = [];
+  let rfDoors: RoboflowPrediction[] = [];
+  let rfWindows: RoboflowPrediction[] = [];
+  let imgW = 1000;
+  let imgH = 1000;
 
-  // ── Pass 2: refine each room's bounding box in parallel ──
-  const refinedBoxes = await Promise.all(
-    parsed.map(room => refineRoomBox(model, base64Image, mimeType, room))
-  );
+  try {
+    const rf = await detectWithRoboflow(floorPlanUrl);
+    rfWalls   = rf.walls;
+    rfDoors   = rf.doors;
+    rfWindows = rf.windows;
+    imgW      = rf.imageWidth;
+    imgH      = rf.imageHeight;
+    console.log(`Roboflow: ${rfWalls.length} walls, ${rfDoors.length} doors, ${rfWindows.length} windows`);
+  } catch (rfErr) {
+    console.error('Roboflow detection failed, falling back to Gemini only:', rfErr);
+  }
 
-  // ── Pass 3: detect doors and windows ──
-  const openings = await detectOpenings(model, base64Image, mimeType);
+  // ── Step 2: Gemini — room naming and positioning ──
+  const parsed = await nameRoomsWithGemini(model, base64Image, mimeType, rfWalls, imgW, imgH);
 
+  // ── Step 3: Convert Roboflow walls to normalised wall segments ──
+  // Roboflow returns bounding boxes for wall segments. We convert to line segments
+  // by using the longer axis as the wall direction.
+  const wallSegments = rfWalls.map(w => {
+    const isHorizontal = w.width > w.height;
+    // Normalise to 0-100% of image dimensions
+    if (isHorizontal) {
+      return {
+        x1: ((w.x - w.width / 2) / imgW) * 100,
+        y1: (w.y / imgH) * 100,
+        x2: ((w.x + w.width / 2) / imgW) * 100,
+        y2: (w.y / imgH) * 100,
+        thickness: Math.max(0.5, (w.height / imgH) * 100),
+      };
+    } else {
+      return {
+        x1: (w.x / imgW) * 100,
+        y1: ((w.y - w.height / 2) / imgH) * 100,
+        x2: (w.x / imgW) * 100,
+        y2: ((w.y + w.height / 2) / imgH) * 100,
+        thickness: Math.max(0.5, (w.width / imgW) * 100),
+      };
+    }
+  });
+
+  // ── Step 4: Convert Roboflow doors/windows to openings ──
+  const openings: RawOpening[] = [
+    ...rfDoors.map(d => ({
+      type: 'door' as const,
+      wall: (d.width > d.height ? 'horizontal' : 'vertical') as 'horizontal' | 'vertical',
+      x: (d.x / imgW) * 1000,
+      y: (d.y / imgH) * 1000,
+      width: (Math.max(d.width, d.height) / Math.max(imgW, imgH)) * 1000,
+    })),
+    ...rfWindows.map(w => ({
+      type: 'window' as const,
+      wall: (w.width > w.height ? 'horizontal' : 'vertical') as 'horizontal' | 'vertical',
+      x: (w.x / imgW) * 1000,
+      y: (w.y / imgH) * 1000,
+      width: (Math.max(w.width, w.height) / Math.max(imgW, imgH)) * 1000,
+    })),
+  ];
+
+  // ── Step 5: Build room list from Gemini naming ──
   const FT_TO_M = 0.3048;
-
-  // Safety net: auto-number any duplicate names Gemini might still produce
   const nameCounts = new Map<string, number>();
   const totalCounts = new Map<string, number>();
   for (const room of parsed) {
@@ -316,15 +477,11 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
     if (total > 1) {
       const seen = (nameCounts.get(room.name) || 0) + 1;
       nameCounts.set(room.name, seen);
-      // Don't double-number names that already end in a digit (e.g. "Bedroom 2")
-      if (!/\d+$/.test(room.name.trim())) {
-        displayName = `${room.name} ${seen}`;
-      }
+      if (!/\d+$/.test(room.name.trim())) displayName = `${room.name} ${seen}`;
     }
 
-    // Use the refined box from pass 2 if available, otherwise fall back to pass 1's box
-    const finalBox2d = refinedBoxes[index] || room.box_2d;
-
+    // Use Gemini box for room overlay positioning
+    const finalBox2d = room.box_2d;
     let box: Room['box'] = undefined;
     if (Array.isArray(finalBox2d) && finalBox2d.length === 4) {
       const [ymin, xmin, ymax, xmax] = finalBox2d;
@@ -336,7 +493,6 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
       };
     }
 
-    // Convert extracted dimensions to metres (Room schema stores length/width in metres)
     let length: number | undefined;
     let width: number | undefined;
     if (room.dimensions && room.dimensions.length > 0 && room.dimensions.width > 0) {
@@ -346,17 +502,17 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
     }
 
     return {
-      id:         `${projectId}-r${index + 1}`,
-      name:       displayName,
+      id: `${projectId}-r${index + 1}`,
+      name: displayName,
       confidence: Math.min(100, Math.max(0, Math.round(room.confidence))),
-      color:      room.color || '#e5e7eb',
+      color: room.color || '#e5e7eb',
       box,
       length,
       width,
     };
   });
 
-  return { rooms: roomList, openings };
+  return { rooms: roomList, walls: wallSegments, openings };
 }
 
 // ─── Step 1: Create project ───────────────────────────────────────────────────
@@ -502,21 +658,25 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
     // Detect rooms using Gemini Vision
     let detectedRooms: Room[] = [];
     let detectedOpenings: RawOpening[] = [];
+    let detectedWalls: Array<{ x1: number; y1: number; x2: number; y2: number; thickness: number }> = [];
     try {
       const detection = await detectRooms(publicUrl, projectId);
       detectedRooms    = detection.rooms;
       detectedOpenings = detection.openings;
+      detectedWalls    = detection.walls;
+      console.log(`Detection complete: ${detectedRooms.length} rooms, ${detectedWalls.length} walls, ${detectedOpenings.length} openings`);
     } catch (aiErr) {
-      console.error('Gemini room detection failed:', aiErr);
+      console.error('Detection failed:', aiErr);
       detectedRooms = [];
     }
 
-    if (detectedRooms.length > 0) {
+    if (detectedRooms.length > 0 || detectedWalls.length > 0) {
       await supabase
         .from('projects')
         .update({
           room_data: {
             rooms:    detectedRooms,
+            walls:    detectedWalls,
             openings: detectedOpenings,
           },
           updated_at: new Date().toISOString(),
@@ -530,8 +690,9 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
         project:        updated,
         floor_plan_url: publicUrl,
         detected_rooms: detectedRooms,
+        walls:          detectedWalls,
         openings:       detectedOpenings,
-        ai_detected:    detectedRooms.length > 0,
+        ai_detected:    detectedRooms.length > 0 || detectedWalls.length > 0,
       },
     });
 
