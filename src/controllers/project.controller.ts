@@ -204,50 +204,10 @@ async function refineRoomBox(
   }
 }
 
-// Pass 3 — get the actual wall polygon for a single room
-// Returns array of [x, y] points (0-1000 scale) tracing the room perimeter
-async function detectRoomPolygon(
-  model: ReturnType<GoogleGenerativeAI['getGenerativeModel']>,
-  base64Image: string,
-  mimeType: string,
-  room: RawRoom,
-  refinedBox: [number, number, number, number] | null
-): Promise<[number, number][] | null> {
-  const box = refinedBox || room.box_2d;
-  if (!box) return null;
-
-  const prompt = `
-    You are analyzing a floor plan image. Look at the room called "${room.name}".
-    Its approximate location is the bounding box [ymin,xmin,ymax,xmax] = ${JSON.stringify(box)} (0-1000 scale).
-
-    Trace the EXACT wall polygon of this room by listing its corner points in order.
-    Follow the actual wall lines in the floor plan — not the bounding box.
-    Include every corner where walls meet, going clockwise.
-
-    Return ONLY a JSON object with this exact shape:
-    {"points":[[x1,y1],[x2,y2],[x3,y3],...]}
-
-    Where each [x,y] is normalized to 0-1000 scale (0,0 = top-left of image).
-    Return at least 4 points. Maximum 12 points.
-    Only return the JSON object, nothing else.
-  `;
-
-  try {
-    const result = await model.generateContent([
-      { text: prompt },
-      { inlineData: { data: base64Image, mimeType } },
-    ]);
-    const parsed = JSON.parse(extractJsonObject(result.response.text().trim()));
-    if (Array.isArray(parsed.points) && parsed.points.length >= 4) {
-      return parsed.points as [number, number][];
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Room[]> {
+async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
+  rooms: Room[];
+  building_perimeter?: [number, number][];
+}> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set');
 
@@ -276,21 +236,6 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
     parsed.map(room => refineRoomBox(model, base64Image, mimeType, room))
   );
 
-  // ── Pass 3: get wall polygon for each room in parallel ──
-  // Run after pass 2 so we can pass the refined box as a hint.
-  // Limit concurrency to avoid rate limits — process in batches of 4.
-  const polygons: ([number, number][] | null)[] = new Array(parsed.length).fill(null);
-  const batchSize = 4;
-  for (let i = 0; i < parsed.length; i += batchSize) {
-    const batch = parsed.slice(i, i + batchSize);
-    const results = await Promise.all(
-      batch.map((room, batchIdx) =>
-        detectRoomPolygon(model, base64Image, mimeType, room, refinedBoxes[i + batchIdx])
-      )
-    );
-    results.forEach((r, batchIdx) => { polygons[i + batchIdx] = r; });
-  }
-
   const FT_TO_M = 0.3048;
 
   // Safety net: auto-number any duplicate names Gemini might still produce
@@ -300,7 +245,7 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
     totalCounts.set(room.name, (totalCounts.get(room.name) || 0) + 1);
   }
 
-  return parsed.map((room, index) => {
+  const roomList = parsed.map((room, index) => {
     let displayName = room.name;
     const total = totalCounts.get(room.name) || 1;
     if (total > 1) {
@@ -341,11 +286,12 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<Roo
       confidence: Math.min(100, Math.max(0, Math.round(room.confidence))),
       color:      room.color || '#e5e7eb',
       box,
-      polygon:    polygons[index] ?? undefined,
       length,
       width,
     };
   });
+
+  return { rooms: roomList };
 }
 
 // ─── Step 1: Create project ───────────────────────────────────────────────────
@@ -490,22 +436,25 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
 
     // Detect rooms using Gemini Vision
     let detectedRooms: Room[] = [];
+    let buildingPerimeter: [number, number][] | undefined;
     try {
-      detectedRooms = await detectRooms(publicUrl, projectId);
+      const detection = await detectRooms(publicUrl, projectId);
+      detectedRooms     = detection.rooms;
+      buildingPerimeter = detection.building_perimeter;
     } catch (aiErr) {
-      // AI detection failed — return empty rooms, user can add manually
       console.error('Gemini room detection failed:', aiErr);
       detectedRooms = [];
     }
 
-    // Persist detected rooms immediately so the canvas page can load them
-    // without requiring a separate saveRooms() call from the frontend.
-    // If detection failed we still write an empty array so room_data is never {}.
+    // Persist detected rooms + building perimeter immediately
     if (detectedRooms.length > 0) {
       await supabase
         .from('projects')
         .update({
-          room_data:  { rooms: detectedRooms },
+          room_data: {
+            rooms: detectedRooms,
+            ...(buildingPerimeter ? { building_perimeter: buildingPerimeter } : {}),
+          },
           updated_at: new Date().toISOString(),
         })
         .eq('id', projectId);
@@ -514,10 +463,11 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
     return res.status(200).json({
       success: true,
       data: {
-        project:        updated,
-        floor_plan_url: publicUrl,
-        detected_rooms: detectedRooms,
-        ai_detected:    detectedRooms.length > 0,
+        project:           updated,
+        floor_plan_url:    publicUrl,
+        detected_rooms:    detectedRooms,
+        building_perimeter: buildingPerimeter,
+        ai_detected:       detectedRooms.length > 0,
       },
     });
 
