@@ -527,68 +527,92 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
       const samPromises = parsed.map(async (room, idx) => {
         if (!room.box_2d) return null;
         const [ymin, xmin, ymax, xmax] = room.box_2d;
-        // Center point of room in 0-1 scale
-        const cx = ((xmin + xmax) / 2) / 1000;
-        const cy = ((ymin + ymax) / 2) / 1000;
+        // Center point in pixel coordinates (SAM-2 expects pixels)
+        const centerX = Math.round(((xmin + xmax) / 2 / 1000) * imgW);
+        const centerY = Math.round(((ymin + ymax) / 2 / 1000) * imgH);
 
         try {
-          // Call SAM-2 via Replicate
-          const response = await fetch('https://api.replicate.com/v1/models/meta/sam-2/predictions', {
+          // Call SAM-2 via Replicate - correct endpoint format
+          const response = await fetch('https://api.replicate.com/v1/predictions', {
             method: 'POST',
             headers: {
               'Authorization': `Bearer ${replicateToken}`,
               'Content-Type': 'application/json',
-              'Prefer': 'wait', // wait for result synchronously (up to 60s)
+              'Prefer': 'wait',
             },
             body: JSON.stringify({
+              version: 'cbd95fb76192174268b6b303aeeb7a736e8dab0cbc38177f09db79b2299da30b',
               input: {
                 image: floorPlanUrl,
-                point_coords: [[cx, cy]],
-                point_labels: [1], // 1 = foreground point
+                point_coords: [[centerX, centerY]],
+                point_labels: [1],
                 multimask_output: false,
+                use_m2m: false,
               },
             }),
           });
 
           if (!response.ok) {
-            console.error(`SAM-2 failed for room ${room.name}: ${response.status}`);
+            const errText = await response.text();
+            console.error(`SAM-2 failed for room ${room.name}: ${response.status} ${errText.slice(0,200)}`);
             return null;
           }
 
           const result = await response.json() as any;
-          const masks = result.output;
-          if (!masks || !masks[0]) return null;
 
-          // SAM-2 returns mask as image URL — fetch and extract polygon
-          const maskUrl = masks[0];
+          // SAM-2 on Replicate returns output as array of mask image URLs
+          // Output format: { output: ["mask_url1", "mask_url2", ...] } or { output: { masks: [...] } }
+          let maskUrl: string | null = null;
+          if (Array.isArray(result.output) && result.output[0]) {
+            maskUrl = result.output[0];
+          } else if (result.output?.masks?.[0]) {
+            maskUrl = result.output.masks[0];
+          }
+
+          if (!maskUrl) {
+            console.error(`SAM-2 no mask for room ${room.name}:`, JSON.stringify(result).slice(0, 200));
+            return null;
+          }
+
+          // Fetch the mask image and extract bounding box using pixel scanning
           const maskRes = await fetch(maskUrl);
           if (!maskRes.ok) return null;
-          const maskBuf = await maskRes.arrayBuffer();
+          const maskBuf = Buffer.from(await maskRes.arrayBuffer());
 
-          // Extract polygon from mask using simple boundary tracing
-          // We convert the mask bounding box to a polygon approximation
-          // (Full pixel-by-pixel polygon extraction requires image processing libraries)
-          // For now we extract the tightest bounding box from SAM's mask metadata
-          if (result.output_metadata) {
-            const meta = result.output_metadata[0];
-            if (meta?.bbox) {
-              const [mx, my, mw, mh] = meta.bbox; // pixel coords
-              return {
-                roomIndex: idx,
-                polygon: [
-                  [(mx / imgW) * 100,          (my / imgH) * 100         ],
-                  [((mx + mw) / imgW) * 100,   (my / imgH) * 100         ],
-                  [((mx + mw) / imgW) * 100,   ((my + mh) / imgH) * 100  ],
-                  [(mx / imgW) * 100,           ((my + mh) / imgH) * 100  ],
-                ] as [number, number][],
-                bbox: {
-                  top:    (my / imgH) * 100,
-                  left:   (mx / imgW) * 100,
-                  width:  (mw / imgW) * 100,
-                  height: (mh / imgH) * 100,
-                },
-              } as RoomPolygon;
+          // Use sharp to get image stats and find the mask bounding box
+          try {
+            const sharp = require('sharp');
+            const { data, info } = await sharp(maskBuf)
+              .greyscale()
+              .raw()
+              .toBuffer({ resolveWithObject: true });
+
+            // Find bounding box of non-zero pixels
+            let minX2 = info.width, maxX2 = 0, minY2 = info.height, maxY2 = 0;
+            for (let y = 0; y < info.height; y++) {
+              for (let x = 0; x < info.width; x++) {
+                const pixel = data[y * info.width + x];
+                if (pixel > 128) {
+                  if (x < minX2) minX2 = x;
+                  if (x > maxX2) maxX2 = x;
+                  if (y < minY2) minY2 = y;
+                  if (y > maxY2) maxY2 = y;
+                }
+              }
             }
+
+            if (maxX2 > minX2 && maxY2 > minY2) {
+              const bbox = {
+                top:    (minY2 / imgH) * 100,
+                left:   (minX2 / imgW) * 100,
+                width:  ((maxX2 - minX2) / imgW) * 100,
+                height: ((maxY2 - minY2) / imgH) * 100,
+              };
+              console.log(`SAM-2 bbox for ${room.name}: top=${bbox.top.toFixed(1)}% left=${bbox.left.toFixed(1)}% w=${bbox.width.toFixed(1)}% h=${bbox.height.toFixed(1)}%`);
+              return { roomIndex: idx, polygon: [], bbox } as RoomPolygon;
+            }
+          } catch (sharpErr) {
+            console.error(`sharp processing failed for ${room.name}:`, sharpErr);
           }
           return null;
         } catch (err) {
