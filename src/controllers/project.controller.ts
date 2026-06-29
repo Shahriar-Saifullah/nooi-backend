@@ -452,9 +452,9 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
   if (!geminiKey) throw new Error('GEMINI_API_KEY is not set');
 
   const genAI = new GoogleGenerativeAI(geminiKey);
-  // Use gemini-2.0-flash — more stable and less prone to 503 than 2.5-flash
+  // gemini-2.5-flash has the best vision capability for floor plan analysis
   const model = genAI.getGenerativeModel({
-    model: 'gemini-2.0-flash',
+    model: 'gemini-2.5-flash',
     generationConfig: { responseMimeType: 'application/json' },
   });
 
@@ -484,21 +484,28 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
     console.error('Roboflow detection failed, falling back to Gemini only:', rfErr);
   }
 
-  // ── Step 2: Gemini — room naming (non-fatal if unavailable) ──
+  // ── Step 2: Gemini — room naming with exponential backoff ──
   let parsed: RawRoom[] = [];
-  try {
-    parsed = await nameRoomsWithGemini(model, base64Image, mimeType, rfWalls, imgW, imgH);
-  } catch (geminiErr: any) {
-    console.error('Gemini room naming failed (will use Roboflow data only):', geminiErr.message || geminiErr);
-    // Retry once after 3 seconds
+  const delays = [3000, 6000, 10000]; // retry after 3s, 6s, 10s
+  let geminiSucceeded = false;
+
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
     try {
-      await new Promise(r => setTimeout(r, 3000));
       parsed = await nameRoomsWithGemini(model, base64Image, mimeType, rfWalls, imgW, imgH);
-      console.log('Gemini retry succeeded');
-    } catch (retryErr) {
-      console.error('Gemini retry also failed — generating rooms from Roboflow wall data');
-      // Generate placeholder rooms from wall clusters so user can still proceed
-      parsed = generateFallbackRooms(rfWalls, rfDoors, imgW, imgH);
+      geminiSucceeded = true;
+      if (attempt > 0) console.log(`Gemini succeeded on attempt ${attempt + 1}`);
+      break;
+    } catch (err: any) {
+      const is503 = err?.status === 503 || err?.message?.includes('503') || err?.message?.includes('Service Unavailable');
+      if (is503 && attempt < delays.length) {
+        console.warn(`Gemini 503 on attempt ${attempt + 1}, retrying in ${delays[attempt]}ms…`);
+        await new Promise(r => setTimeout(r, delays[attempt]));
+      } else {
+        console.error(`Gemini room naming failed after ${attempt + 1} attempts:`, err?.message || err);
+        // Generate placeholder rooms from Roboflow data so user can still proceed
+        parsed = generateFallbackRooms(rfWalls, rfDoors, imgW, imgH);
+        break;
+      }
     }
   }
 
