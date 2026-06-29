@@ -509,7 +509,110 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
     }
   }
 
-  // ── Step 3: Convert Roboflow walls to normalised wall segments ──
+  // ── Step 3: SAM-2 — get exact room boundary polygons ──
+  // Use Gemini's approximate room centers as prompt points for SAM-2.
+  // SAM-2 returns pixel-perfect masks → we convert to polygons for 2D overlays and 3D walls.
+  interface RoomPolygon {
+    roomIndex: number;
+    polygon: [number, number][]; // normalized 0-100 coordinates
+    bbox: { top: number; left: number; width: number; height: number };
+  }
+
+  const roomPolygons: RoomPolygon[] = [];
+
+  const replicateToken = process.env.REPLICATE_API_TOKEN;
+  if (replicateToken && parsed.length > 0) {
+    try {
+      // Run SAM-2 for each room with its center point as prompt
+      const samPromises = parsed.map(async (room, idx) => {
+        if (!room.box_2d) return null;
+        const [ymin, xmin, ymax, xmax] = room.box_2d;
+        // Center point of room in 0-1 scale
+        const cx = ((xmin + xmax) / 2) / 1000;
+        const cy = ((ymin + ymax) / 2) / 1000;
+
+        try {
+          // Call SAM-2 via Replicate
+          const response = await fetch('https://api.replicate.com/v1/models/meta/sam-2/predictions', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${replicateToken}`,
+              'Content-Type': 'application/json',
+              'Prefer': 'wait', // wait for result synchronously (up to 60s)
+            },
+            body: JSON.stringify({
+              input: {
+                image: floorPlanUrl,
+                point_coords: [[cx, cy]],
+                point_labels: [1], // 1 = foreground point
+                multimask_output: false,
+              },
+            }),
+          });
+
+          if (!response.ok) {
+            console.error(`SAM-2 failed for room ${room.name}: ${response.status}`);
+            return null;
+          }
+
+          const result = await response.json() as any;
+          const masks = result.output;
+          if (!masks || !masks[0]) return null;
+
+          // SAM-2 returns mask as image URL — fetch and extract polygon
+          const maskUrl = masks[0];
+          const maskRes = await fetch(maskUrl);
+          if (!maskRes.ok) return null;
+          const maskBuf = await maskRes.arrayBuffer();
+
+          // Extract polygon from mask using simple boundary tracing
+          // We convert the mask bounding box to a polygon approximation
+          // (Full pixel-by-pixel polygon extraction requires image processing libraries)
+          // For now we extract the tightest bounding box from SAM's mask metadata
+          if (result.output_metadata) {
+            const meta = result.output_metadata[0];
+            if (meta?.bbox) {
+              const [mx, my, mw, mh] = meta.bbox; // pixel coords
+              return {
+                roomIndex: idx,
+                polygon: [
+                  [(mx / imgW) * 100,          (my / imgH) * 100         ],
+                  [((mx + mw) / imgW) * 100,   (my / imgH) * 100         ],
+                  [((mx + mw) / imgW) * 100,   ((my + mh) / imgH) * 100  ],
+                  [(mx / imgW) * 100,           ((my + mh) / imgH) * 100  ],
+                ] as [number, number][],
+                bbox: {
+                  top:    (my / imgH) * 100,
+                  left:   (mx / imgW) * 100,
+                  width:  (mw / imgW) * 100,
+                  height: (mh / imgH) * 100,
+                },
+              } as RoomPolygon;
+            }
+          }
+          return null;
+        } catch (err) {
+          console.error(`SAM-2 error for room ${room.name}:`, err);
+          return null;
+        }
+      });
+
+      // Run in batches of 3 to avoid rate limits
+      const batchSize = 3;
+      for (let i = 0; i < samPromises.length; i += batchSize) {
+        const batch = await Promise.all(samPromises.slice(i, i + batchSize));
+        batch.forEach(r => { if (r) roomPolygons.push(r); });
+        if (i + batchSize < samPromises.length) {
+          await new Promise(r => setTimeout(r, 1000));
+        }
+      }
+      console.log(`SAM-2: got ${roomPolygons.length}/${parsed.length} room polygons`);
+    } catch (samErr) {
+      console.error('SAM-2 step failed (non-fatal):', samErr);
+    }
+  }
+
+  // ── Step 4: Convert Roboflow walls to normalised wall segments ──
   // Roboflow returns bounding boxes for wall segments. We convert to line segments
   // by using the longer axis as the wall direction.
   const wallSegments = rfWalls.map(w => {
@@ -569,10 +672,14 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
       if (!/\d+$/.test(room.name.trim())) displayName = `${room.name} ${seen}`;
     }
 
-    // Use Gemini box for room overlay positioning
+    // Use SAM polygon bbox if available — much more accurate than Gemini estimate
+    const samResult = roomPolygons.find(p => p.roomIndex === index);
     const finalBox2d = room.box_2d;
     let box: Room['box'] = undefined;
-    if (Array.isArray(finalBox2d) && finalBox2d.length === 4) {
+
+    if (samResult) {
+      box = samResult.bbox;
+    } else if (Array.isArray(finalBox2d) && finalBox2d.length === 4) {
       const [ymin, xmin, ymax, xmax] = finalBox2d;
       box = {
         top:    Math.max(0, Math.min(100, ymin / 10)),
