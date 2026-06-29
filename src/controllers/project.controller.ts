@@ -53,12 +53,41 @@ interface RawRoom {
   dimensions?: { length: number; width: number; unit: 'ft' | 'm' } | null;
 }
 
-function stripJsonFences(text: string): string {
-  return text
+function extractJson(text: string): string {
+  // Strip markdown fences first
+  let cleaned = text
     .replace(/^```json\s*/i, '')
     .replace(/^```\s*/i, '')
     .replace(/\s*```$/i, '')
     .trim();
+
+  // Find the first '[' and last ']' to extract just the array,
+  // ignoring any trailing text or comments Gemini appended
+  const start = cleaned.indexOf('[');
+  const end   = cleaned.lastIndexOf(']');
+
+  if (start === -1 || end === -1 || end < start) {
+    throw new Error(`No JSON array found in Gemini response. Raw: ${cleaned.slice(0, 200)}`);
+  }
+
+  return cleaned.slice(start, end + 1);
+}
+
+function extractJsonObject(text: string): string {
+  let cleaned = text
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+
+  const start = cleaned.indexOf('{');
+  const end   = cleaned.lastIndexOf('}');
+
+  if (start === -1 || end === -1 || end < start) {
+    throw new Error(`No JSON object found in Gemini response. Raw: ${cleaned.slice(0, 200)}`);
+  }
+
+  return cleaned.slice(start, end + 1);
 }
 
 // Pass 1 — detect all rooms with names, colors, dimensions, and a first-guess box
@@ -127,7 +156,13 @@ async function detectRoomsPass1(
     { inlineData: { data: base64Image, mimeType } },
   ]);
 
-  return JSON.parse(stripJsonFences(result.response.text().trim()));
+  const rawText = result.response.text().trim();
+  try {
+    return JSON.parse(extractJson(rawText));
+  } catch (parseErr) {
+    console.error('Pass 1 JSON parse failed. Raw Gemini response:', rawText.slice(0, 500));
+    throw parseErr;
+  }
 }
 
 // Pass 2 — re-examine the same full image, but ask Gemini to tighten ONE room's box
@@ -158,7 +193,7 @@ async function refineRoomBox(
       { text: prompt },
       { inlineData: { data: base64Image, mimeType } },
     ]);
-    const parsed = JSON.parse(stripJsonFences(result.response.text().trim()));
+    const parsed = JSON.parse(extractJsonObject(result.response.text().trim()));
     if (Array.isArray(parsed.box_2d) && parsed.box_2d.length === 4) {
       return parsed.box_2d as [number, number, number, number];
     }
