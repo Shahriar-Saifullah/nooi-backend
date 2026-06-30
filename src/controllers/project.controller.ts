@@ -509,119 +509,17 @@ async function detectRooms(floorPlanUrl: string, projectId: string): Promise<{
     }
   }
 
-  // ── Step 3: SAM-2 — get exact room boundary masks ──
-  // SAM-2's automatic mode takes ONE call per image and returns all detected
-  // segments. We match each returned mask to the closest Gemini room center.
+  // ── Step 3: SAM-2 disabled ──
+  // Tested extensively: SAM-2's automatic mode segments floor plans like photos,
+  // detecting small architectural symbols (door arcs, fixtures) rather than whole
+  // room boundaries. Multiple distinct rooms matched to the same tiny mask in testing.
+  // Gemini's room boxes (already aligned correctly in the frontend) are used directly.
   interface RoomPolygon {
     roomIndex: number;
     polygon: [number, number][];
     bbox: { top: number; left: number; width: number; height: number };
   }
-
   const roomPolygons: RoomPolygon[] = [];
-
-  const replicateToken = process.env.REPLICATE_API_TOKEN;
-  if (replicateToken && parsed.length > 0) {
-    try {
-      const response = await fetch('https://api.replicate.com/v1/predictions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${replicateToken}`,
-          'Content-Type': 'application/json',
-          'Prefer': 'wait',
-        },
-        body: JSON.stringify({
-          version: 'fe97b453a6455861e3bac769b441ca1f1086110da7466dbb65cf1eecfd60dc83',
-          input: {
-            image: floorPlanUrl,
-            use_m2m: true,
-            points_per_side: 32,
-            pred_iou_thresh: 0.86,
-            stability_score_thresh: 0.9,
-          },
-        }),
-      });
-
-      if (!response.ok) {
-        const errText = await response.text();
-        console.error(`SAM-2 failed: ${response.status} ${errText.slice(0, 300)}`);
-      } else {
-        const result = await response.json() as any;
-        const maskUrls: string[] = result.output?.individual_masks || [];
-        console.log(`SAM-2: received ${maskUrls.length} individual masks`);
-
-        if (maskUrls.length > 0) {
-          const sharp = require('sharp');
-
-          // For each mask, compute its bounding box once
-          const maskBboxes: Array<{ top: number; left: number; width: number; height: number; centerX: number; centerY: number } | null> =
-            await Promise.all(maskUrls.map(async (maskUrl) => {
-              try {
-                const maskRes = await fetch(maskUrl);
-                if (!maskRes.ok) return null;
-                const maskBuf = Buffer.from(await maskRes.arrayBuffer());
-                const { data, info } = await sharp(maskBuf).greyscale().raw().toBuffer({ resolveWithObject: true });
-
-                let minX = info.width, maxX = 0, minY = info.height, maxY = 0;
-                for (let y = 0; y < info.height; y++) {
-                  for (let x = 0; x < info.width; x++) {
-                    if (data[y * info.width + x] > 128) {
-                      if (x < minX) minX = x;
-                      if (x > maxX) maxX = x;
-                      if (y < minY) minY = y;
-                      if (y > maxY) maxY = y;
-                    }
-                  }
-                }
-                if (maxX <= minX || maxY <= minY) return null;
-                return {
-                  top:    (minY / imgH) * 100,
-                  left:   (minX / imgW) * 100,
-                  width:  ((maxX - minX) / imgW) * 100,
-                  height: ((maxY - minY) / imgH) * 100,
-                  centerX: (minX + maxX) / 2,
-                  centerY: (minY + maxY) / 2,
-                };
-              } catch {
-                return null;
-              }
-            }));
-
-          // Match each Gemini room (by its center point) to the closest SAM mask
-          parsed.forEach((room, idx) => {
-            if (!room.box_2d) return;
-            const [ymin, xmin, ymax, xmax] = room.box_2d;
-            const roomCenterX = ((xmin + xmax) / 2 / 1000) * imgW;
-            const roomCenterY = ((ymin + ymax) / 2 / 1000) * imgH;
-
-            type MaskBbox = { top: number; left: number; width: number; height: number; centerX: number; centerY: number };
-            let bestMatch: MaskBbox | null = null;
-            let bestDist = Infinity;
-            maskBboxes.forEach(bbox => {
-              if (!bbox) return;
-              const dist = Math.hypot(bbox.centerX - roomCenterX, bbox.centerY - roomCenterY);
-              if (dist < bestDist) { bestDist = dist; bestMatch = bbox; }
-            });
-
-            // Only accept the match if it's reasonably close (within 15% of image diagonal)
-            const maxDist = Math.hypot(imgW, imgH) * 0.15;
-            if (bestMatch && bestDist < maxDist) {
-              const m: MaskBbox = bestMatch;
-              console.log(`SAM-2 matched "${room.name}" → mask bbox top=${m.top.toFixed(1)}% left=${m.left.toFixed(1)}% w=${m.width.toFixed(1)}% h=${m.height.toFixed(1)}%`);
-              roomPolygons.push({
-                roomIndex: idx,
-                polygon: [],
-                bbox: { top: m.top, left: m.left, width: m.width, height: m.height },
-              });
-            }
-          });
-        }
-      }
-      console.log(`SAM-2: matched ${roomPolygons.length}/${parsed.length} rooms to masks`);
-    } catch (samErr) {
-      console.error('SAM-2 step failed (non-fatal):', samErr);
-    }
-  }
 
   // ── Step 4: Convert Roboflow walls to normalised wall segments ──
   // Roboflow returns bounding boxes for wall segments. We convert to line segments
