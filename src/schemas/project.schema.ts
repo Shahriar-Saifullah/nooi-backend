@@ -18,6 +18,7 @@ export const roomSchema = z.object({
   width:      z.number().positive().optional(),
   height:     z.number().positive().optional(),
   box:        roomBoxSchema.optional(), // position on the floor plan image, as % (top/left/width/height)
+  polygon:    z.array(z.tuple([z.number(), z.number()])).optional(),
   gridRow:    z.number().int().min(0).optional(),
   gridCol:    z.number().int().min(0).optional(),
   rowWeight:  z.number().positive().optional(),
