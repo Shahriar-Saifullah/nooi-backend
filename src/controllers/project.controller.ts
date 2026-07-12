@@ -59,12 +59,16 @@ interface RawRoom {
 // Gemini is called by the Python service for room naming only.
 // Falls back to Roboflow-only detection if the Python service is unavailable.
 
+// Room + the true-shape polygon from the v3 pipeline ([x%, y%] pairs)
+type DetectedRoom = Room & { polygon?: [number, number][] };
+
 interface DetectionResult {
-  rooms:      Room[];
-  walls:      Array<{ x1: number; y1: number; x2: number; y2: number; thickness: number }>;
-  openings:   Array<{ type: 'door'|'window'; wall: 'horizontal'|'vertical'; x: number; y: number; width: number }>;
+  rooms:      DetectedRoom[];
+  walls:      Array<{ id?: string; x1: number; y1: number; x2: number; y2: number; thickness: number }>;
+  openings:   Array<{ type: 'door'|'window'; wall: 'horizontal'|'vertical'; x: number; y: number; width: number; wall_id?: string }>;
   imgW:       number;
   imgH:       number;
+  scaleMPerPx: number | null;
 }
 
 async function callFloorPlanService(
@@ -80,7 +84,10 @@ async function callFloorPlanService(
   try {
     const res = await fetch(`${serviceUrl}/analyse`, {
       method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type':  'application/json',
+        'X-Service-Key': process.env.FLOORPLAN_SERVICE_KEY || '',
+      },
       body: JSON.stringify({
         image_url:      imageUrl,
         project_id:     projectId,
@@ -107,12 +114,13 @@ async function callFloorPlanService(
     );
 
     // Convert service response to DetectionResult format
-    const rooms: Room[] = (data.rooms || []).map((r: any) => ({
+    const rooms: DetectedRoom[] = (data.rooms || []).map((r: any) => ({
       id:         r.id,
       name:       r.name,
       confidence: r.confidence ?? 70,
       color:      r.color ?? '#e5e7eb',
       box:        r.box,
+      polygon:    r.polygon,          // v3: true room shape ([x%, y%] pairs)
       length:     r.length,
       width:      r.width,
     }));
@@ -120,9 +128,10 @@ async function callFloorPlanService(
     return {
       rooms,
       walls:    data.walls    || [],
-      openings: data.openings || [],
+      openings: data.openings || [],   // v3: each carries wall_id
       imgW:     data.image_size?.width  || 1000,
       imgH:     data.image_size?.height || 1000,
+      scaleMPerPx: data.scale_m_per_px ?? null,
     };
   } catch (err) {
     console.error('Floor plan service call failed:', err);
@@ -268,7 +277,7 @@ Each: {"name":"unique name","confidence":0-100,"box_2d":[ymin,xmin,ymax,xmax],"c
     })),
   ] : [];
 
-  return { rooms, walls, openings, imgW, imgH };
+  return { rooms, walls, openings, imgW, imgH, scaleMPerPx: null };
 }
 
 // ─── Step 1: Create project ───────────────────────────────────────────────────
@@ -412,10 +421,11 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
     }
 
     // Detect rooms using Gemini Vision
-    let detectedRooms: Room[] = [];
-    let detectedOpenings: Array<{ type: 'door'|'window'; wall: 'horizontal'|'vertical'; x: number; y: number; width: number }> = [];
-    let detectedWalls: Array<{ x1: number; y1: number; x2: number; y2: number; thickness: number }> = [];
+    let detectedRooms: DetectedRoom[] = [];
+    let detectedOpenings: DetectionResult['openings'] = [];
+    let detectedWalls: DetectionResult['walls'] = [];
     let imgW = 1000; let imgH = 1000;
+    let scaleMPerPx: number | null = null;
     try {
       const detection = await detectRooms(publicUrl, projectId);
       detectedRooms    = detection.rooms;
@@ -423,6 +433,7 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
       detectedWalls    = detection.walls;
       imgW             = detection.imgW;
       imgH             = detection.imgH;
+      scaleMPerPx      = detection.scaleMPerPx;
       console.log(`Detection complete: ${detectedRooms.length} rooms, ${detectedWalls.length} walls, ${detectedOpenings.length} openings`);
     } catch (aiErr) {
       console.error('Detection failed:', aiErr);
@@ -438,6 +449,7 @@ export async function uploadFloorPlan(req: AuthRequest, res: Response) {
             walls:      detectedWalls,
             openings:   detectedOpenings,
             image_size: { width: imgW, height: imgH },
+            scale_m_per_px: scaleMPerPx,
           },
           updated_at: new Date().toISOString(),
         })
