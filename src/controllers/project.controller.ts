@@ -521,6 +521,43 @@ export async function saveRooms(req: AuthRequest, res: Response) {
 // ─── Step 4: Save room dimensions ─────────────────────────────────────────────
 // PUT /projects/:id/dimensions
 
+// ── Save furniture placements (3D scene state) ───────────────────────────────
+// Placements live in room_data.furniture; each item carries the catalog
+// modelId plus position/rotation/customization so the scene restores exactly.
+export async function saveFurniture(req: AuthRequest, res: Response) {
+  try {
+    const userId    = req.user!.id;
+    const projectId = String(req.params.id);
+    const { furniture } = req.body as { furniture: unknown[] };
+
+    const project = await verifyOwnership(projectId, userId);
+    if (!project) {
+      return res.status(404).json({ success: false, error: 'Project not found' });
+    }
+
+    const existing = (project.room_data as any) ?? {};
+    const { data, error } = await supabase
+      .from('projects')
+      .update({
+        room_data: {
+          ...existing,
+          furniture,
+        },
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', projectId)
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+    return res.json({ success: true, data: { furniture } });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+}
+
 export async function saveDimensions(req: AuthRequest, res: Response) {
   try {
     const userId    = req.user!.id;

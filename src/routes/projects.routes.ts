@@ -6,6 +6,7 @@ import {
   createProjectSchema,
   saveRoomsSchema,
   saveDimensionsSchema,
+  saveFurnitureSchema,
   updateProjectSchema,
   generateRenderSchema,
 } from '../schemas/project.schema';
@@ -14,6 +15,7 @@ import {
   uploadFloorPlan,
   saveRooms,
   saveDimensions,
+  saveFurniture,
   confirmProject,
   getProjects,
   getProject,
@@ -36,6 +38,7 @@ router.post('/',                requireAuth, validate(createProjectSchema), crea
 router.post('/:id/floor-plan',  requireAuth, upload.single('floor_plan'),   uploadFloorPlan);
 router.put('/:id/rooms',        requireAuth, validate(saveRoomsSchema),     saveRooms);
 router.put('/:id/dimensions',   requireAuth, validate(saveDimensionsSchema),saveDimensions);
+router.put('/:id/furniture',    requireAuth, validate(saveFurnitureSchema), saveFurniture);
 router.post('/:id/confirm',     requireAuth,                                confirmProject);
 router.post('/:id/generate-render', requireAuth, validate(generateRenderSchema), generateRender);
 
