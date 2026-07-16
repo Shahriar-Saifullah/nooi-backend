@@ -102,3 +102,24 @@ export const generateRenderSchema = z.object({
 });
 
 export type GenerateRenderInput = z.infer<typeof generateRenderSchema>;
+
+// ── ADD to src/schemas/project.schema.ts (backend) ───────────────────────────
+
+export const furnitureItemSchema = z.object({
+  id:             z.string(),
+  name:           z.string(),
+  position:       z.tuple([z.number(), z.number(), z.number()]),
+  rotation:       z.number(),
+  modelId:        z.string().optional(),
+  sizeScale:      z.number().min(0.2).max(4).optional(),
+  color:          z.string().nullable().optional(),
+  materialPreset: z.string().nullable().optional(),
+  scale:          z.tuple([z.number(), z.number(), z.number()]).optional(),
+  width:          z.number().optional(),
+  depth:          z.number().optional(),
+  height:         z.number().optional(),
+});
+
+export const saveFurnitureSchema = z.object({
+  furniture: z.array(furnitureItemSchema).max(300),
+});
