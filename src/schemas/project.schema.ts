@@ -2,6 +2,13 @@ import { z } from 'zod';
 
 // ─── Room ─────────────────────────────────────────────────────────────────────
 
+export const roomBoxSchema = z.object({
+  top:    z.number().min(0).max(100),
+  left:   z.number().min(0).max(100),
+  width:  z.number().min(0).max(100),
+  height: z.number().min(0).max(100),
+});
+
 export const roomSchema = z.object({
   id:         z.string(),
   name:       z.string().min(1),
@@ -10,11 +17,17 @@ export const roomSchema = z.object({
   length:     z.number().positive().optional(),
   width:      z.number().positive().optional(),
   height:     z.number().positive().optional(),
+  box:        roomBoxSchema.optional(), // position on the floor plan image, as % (top/left/width/height)
+  polygon:    z.array(z.tuple([z.number(), z.number()])).optional(),
+  gridRow:    z.number().int().min(0).optional(),
+  gridCol:    z.number().int().min(0).optional(),
+  rowWeight:  z.number().positive().optional(),
+  colWeight:  z.number().positive().optional(),
 });
 
 export type Room = z.infer<typeof roomSchema>;
 
-// Create project 
+// ─── Step 1 — Create project ──────────────────────────────────────────────────
 
 export const createProjectSchema = z.object({
   name: z.string()
@@ -29,7 +42,7 @@ export const createProjectSchema = z.object({
 
 export type CreateProjectInput = z.infer<typeof createProjectSchema>;
 
-// Save reviewed rooms 
+// ─── Step 3 — Save reviewed rooms ────────────────────────────────────────────
 
 export const saveRoomsSchema = z.object({
   project_id: z.string().uuid('Invalid project ID'),
@@ -38,13 +51,25 @@ export const saveRoomsSchema = z.object({
 
 export type SaveRoomsInput = z.infer<typeof saveRoomsSchema>;
 
-// Save room dimensions 
+// ─── Step 4 — Save room dimensions ───────────────────────────────────────────
 
 export const roomDimensionSchema = z.object({
-  id:     z.string(),
-  length: z.number().positive('Length must be positive'),
-  width:  z.number().positive('Width must be positive'),
-  height: z.number().positive('Height must be positive'),
+  id:         z.string(),
+  length:     z.number().positive('Length must be positive'),
+  width:      z.number().positive('Width must be positive'),
+  height:     z.number().positive('Height must be positive'),
+  // Layout fields are optional here (older clients may omit them), but when
+  // present they let the canvas page render the same interactive grid the
+  // user arranged during project creation, instead of falling back to a
+  // static, non-interactive image.
+  name:       z.string().optional(),
+  color:      z.string().optional(),
+  confidence: z.number().min(0).max(100).optional(),
+  box:        roomBoxSchema.optional(),
+  gridRow:    z.number().int().min(0).optional(),
+  gridCol:    z.number().int().min(0).optional(),
+  rowWeight:  z.number().positive().optional(),
+  colWeight:  z.number().positive().optional(),
 });
 
 export const saveDimensionsSchema = z.object({
@@ -54,7 +79,7 @@ export const saveDimensionsSchema = z.object({
 
 export type SaveDimensionsInput = z.infer<typeof saveDimensionsSchema>;
 
-// Update project 
+// ─── Update project ───────────────────────────────────────────────────────────
 
 export const updateProjectSchema = z.object({
   name:            z.string().min(1).max(100).optional(),
@@ -68,3 +93,33 @@ export const updateProjectSchema = z.object({
 });
 
 export type UpdateProjectInput = z.infer<typeof updateProjectSchema>;
+
+// ─── Generate AI render (image) from a text prompt + current room layout ─────
+
+export const generateRenderSchema = z.object({
+  prompt: z.string().min(1, 'Prompt is required').max(2000),
+  model:  z.enum(['gemini', 'dalle', 'midjourney', 'flux', 'stable-diffusion'] as const).optional().default('gemini'),
+});
+
+export type GenerateRenderInput = z.infer<typeof generateRenderSchema>;
+
+// ── ADD to src/schemas/project.schema.ts (backend) ───────────────────────────
+
+export const furnitureItemSchema = z.object({
+  id:             z.string(),
+  name:           z.string(),
+  position:       z.tuple([z.number(), z.number(), z.number()]),
+  rotation:       z.number(),
+  modelId:        z.string().optional(),
+  sizeScale:      z.number().min(0.2).max(4).optional(),
+  color:          z.string().nullable().optional(),
+  materialPreset: z.string().nullable().optional(),
+  scale:          z.tuple([z.number(), z.number(), z.number()]).optional(),
+  width:          z.number().optional(),
+  depth:          z.number().optional(),
+  height:         z.number().optional(),
+});
+
+export const saveFurnitureSchema = z.object({
+  furniture: z.array(furnitureItemSchema).max(300),
+});
