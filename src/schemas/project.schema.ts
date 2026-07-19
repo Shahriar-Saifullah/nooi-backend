@@ -123,3 +123,8 @@ export const furnitureItemSchema = z.object({
 export const saveFurnitureSchema = z.object({
   furniture: z.array(furnitureItemSchema).max(300),
 });
+
+// ── Sharing ──────────────────────────────────────────────────────────────────
+export const toggleShareSchema = z.object({
+  enabled: z.boolean(),
+});
