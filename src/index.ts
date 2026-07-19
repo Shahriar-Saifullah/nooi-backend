@@ -12,6 +12,7 @@ import orderRoutes    from './routes/orders.routes';
 import { errorHandler } from './middleware/errorHandler';
 import onboardingRoutes from './routes/onboarding.routes';
 import profileRoutes from './routes/profile.routes';
+import sharedRoutes from './routes/shared.routes';
 
 
 
@@ -44,7 +45,11 @@ app.use('/projects', projectRoutes);
 app.use('/ai', aiRoutes);
 app.use('/orders', orderRoutes);
 app.use('/onboarding', onboardingRoutes);
+
+
+
 app.use('/profile', profileRoutes);
+app.use('/shared', sharedRoutes);
 
 // Error handler
 app.use(errorHandler);

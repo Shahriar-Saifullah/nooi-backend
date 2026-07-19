@@ -9,6 +9,7 @@ import {
   saveFurnitureSchema,
   updateProjectSchema,
   generateRenderSchema,
+  toggleShareSchema,
 } from '../schemas/project.schema';
 import {
   createProject,
@@ -22,6 +23,7 @@ import {
   updateProject,
   deleteProject,
   generateRender,
+  toggleShare,
 } from '../controllers/project.controller';
 
 const router = Router();
@@ -41,6 +43,7 @@ router.put('/:id/dimensions',   requireAuth, validate(saveDimensionsSchema),save
 router.put('/:id/furniture',    requireAuth, validate(saveFurnitureSchema), saveFurniture);
 router.post('/:id/confirm',     requireAuth,                                confirmProject);
 router.post('/:id/generate-render', requireAuth, validate(generateRenderSchema), generateRender);
+router.post('/:id/share',       requireAuth, validate(toggleShareSchema),   toggleShare);
 
 // ─── Standard CRUD ────────────────────────────────────────────────────────────
 

@@ -1,4 +1,5 @@
-import { Response } from 'express';
+import { Request, Response } from 'express';
+import crypto from 'crypto';
 import { supabase } from '../services/supabase';
 import { AuthRequest } from '../types';
 import { GoogleGenerativeAI } from '@google/generative-ai';
@@ -928,5 +929,74 @@ export async function generateRender(req: AuthRequest, res: Response) {
   } catch (err) {
     console.error('Generate render error:', err);
     return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+// ─── Sharing: public read-only links ─────────────────────────────────────────
+// POST /projects/:id/share  { enabled: boolean }
+// Generates an unguessable token the first time sharing is enabled; toggling
+// off keeps the token so re-enabling restores the same link.
+export async function toggleShare(req: AuthRequest, res: Response) {
+  try {
+    const userId    = req.user!.id;
+    const projectId = String(req.params.id);
+    const { enabled } = req.body as { enabled: boolean };
+
+    const project = await verifyOwnership(projectId, userId);
+    if (!project) {
+      return res.status(404).json({ success: false, error: 'Project not found' });
+    }
+
+    // fetch current token (verifyOwnership doesn't select it)
+    const { data: row } = await supabase
+      .from('projects')
+      .select('share_token')
+      .eq('id', projectId)
+      .single();
+
+    const share_token =
+      row?.share_token ?? crypto.randomBytes(24).toString('base64url');
+
+    const { error } = await supabase
+      .from('projects')
+      .update({
+        share_token,
+        share_enabled: enabled,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', projectId);
+
+    if (error) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+    return res.json({ success: true, data: { share_enabled: enabled, share_token } });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+}
+
+// GET /shared/:token — PUBLIC, no auth.
+// Returns only what the read-only viewer needs; never the owner's identity.
+export async function getSharedProject(req: Request, res: Response) {
+  try {
+    const token = String(req.params.token || '');
+    // base64url of 24 bytes = 32 chars; reject junk early
+    if (!/^[A-Za-z0-9_-]{20,64}$/.test(token)) {
+      return res.status(404).json({ success: false, error: 'Not found' });
+    }
+
+    const { data, error } = await supabase
+      .from('projects')
+      .select('name, project_type, room_data, updated_at')
+      .eq('share_token', token)
+      .eq('share_enabled', true)
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({ success: false, error: 'Not found' });
+    }
+    return res.json({ success: true, data: { project: data } });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
   }
 }
