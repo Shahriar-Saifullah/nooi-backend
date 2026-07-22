@@ -128,3 +128,26 @@ export const saveFurnitureSchema = z.object({
 export const toggleShareSchema = z.object({
   enabled: z.boolean(),
 });
+
+// ── AI furnish (natural-language furniture placement) ────────────────────────
+export const aiFurnishSchema = z.object({
+  command: z.string().min(3).max(500),
+  rooms: z.array(z.object({
+    id: z.string(),
+    name: z.string(),
+    rect: z.object({ x: z.number(), z: z.number(), w: z.number(), d: z.number() }),
+  })).min(1).max(40),
+  catalog: z.array(z.object({
+    id: z.string(),
+    name: z.string(),
+    category: z.string(),
+    w: z.number(),   // footprint cm
+    d: z.number(),
+  })).min(1).max(80),
+  existing: z.array(z.object({
+    name: z.string(),
+    x: z.number(),
+    z: z.number(),
+  })).max(100).optional(),
+});
+export type AiFurnishInput = z.infer<typeof aiFurnishSchema>;
