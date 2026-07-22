@@ -144,6 +144,7 @@ export const aiFurnishSchema = z.object({
     category: z.string(),
     w: z.number(),   // footprint cm
     d: z.number(),
+    h: z.number().optional(),   // height cm — flat items (rugs) skip collision
   })).min(1).max(80),
   existing: z.array(z.object({
     name: z.string(),
