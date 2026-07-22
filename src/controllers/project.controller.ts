@@ -1061,9 +1061,40 @@ If no room matches the command, respond: {"error": "<short explanation>"}`;
 
     const { GoogleGenerativeAI } = await import('@google/generative-ai');
     const genAI = new GoogleGenerativeAI(geminiKey);
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-    const result = await model.generateContent(prompt);
-    const raw = result.response.text().replace(/```json|```/g, '').trim();
+
+    // Gemini occasionally 503s under load ("high demand"). Retry with backoff,
+    // then fall back to the previous-generation flash model before giving up.
+    const MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+    let raw: string | null = null;
+    let lastErr: any = null;
+    attempts: for (const modelName of MODELS) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const model = genAI.getGenerativeModel({ model: modelName });
+          const result = await model.generateContent(prompt);
+          raw = result.response.text().replace(/```json|```/g, '').trim();
+          break attempts;
+        } catch (e: any) {
+          lastErr = e;
+          const msg = String(e?.message || '');
+          const transient =
+            msg.includes('503') || msg.includes('429') ||
+            /overloaded|high demand|unavailable|fetch failed|ECONNRESET|timeout/i.test(msg);
+          if (!transient) break attempts; // config/auth errors: fail fast, don't hammer
+          await new Promise(r => setTimeout(r, 700 * (attempt + 1)));
+        }
+      }
+    }
+    if (raw === null) {
+      const msg = String(lastErr?.message || '');
+      const busy = msg.includes('503') || /overloaded|high demand/i.test(msg);
+      return res.status(busy ? 503 : 502).json({
+        success: false,
+        error: busy
+          ? 'The AI is busy right now — please try again in a moment.'
+          : 'AI request failed — please try again.',
+      });
+    }
 
     let parsed: any;
     try { parsed = JSON.parse(raw); }
