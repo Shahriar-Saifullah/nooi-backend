@@ -1017,7 +1017,7 @@ export async function aiFurnish(req: AuthRequest, res: Response) {
         rect: { x: number; z: number; w: number; d: number };
         polygon?: [number, number][];
       }[];
-      catalog: { id: string; name: string; category: string; w: number; d: number }[];
+      catalog: { id: string; name: string; category: string; w: number; d: number; h?: number }[];
       existing?: { name: string; x: number; z: number }[];
     };
 
@@ -1051,6 +1051,7 @@ TASK: Identify which room the user means (match names loosely — "master bedroo
 - dining chairs around dining tables
 - leave walking clearance; nothing outside the room; nothing overlapping
 - some rooms are non-rectangular (an L-shape's bounding rect includes area outside the room) — when in doubt keep items closer to the room's center
+- keep at least 40cm clearance between separate items (exception: rugs may sit under beds, sofas and tables)
 - positions are the CENTER of each item, in world meters
 - rotation in degrees, one of 0, 90, 180, 270 (rotation about the vertical axis; at 0 the item's w spans the x axis)
 
@@ -1078,6 +1079,12 @@ If no room matches the command, respond: {"error": "<short explanation>"}`;
       return res.status(502).json({ success: false, error: 'AI response did not match the floor plan - try again.' });
     }
 
+    // ── Layout sanitizer ─────────────────────────────────────────────────────
+    // Gemini's coordinates are suggestions; geometry here is law. Each item's
+    // FULL footprint (all four corners, rotation-aware) must lie inside the
+    // room, and footprints may not overlap each other (flat items like rugs
+    // are exempt — they belong under beds and sofas).
+
     // ray-casting point-in-polygon test (world coords)
     const insidePolygon = (x: number, z: number, poly: [number, number][]) => {
       let inside = false;
@@ -1097,45 +1104,115 @@ If no room matches the command, respond: {"error": "<short explanation>"}`;
       ];
     };
 
-    const catalogMap = new Map(catalog.map(c => [c.id, c]));
     const MARGIN = 0.05; // 5cm off the walls minimum
-    const placements = (parsed.placements as any[])
-      .slice(0, 15)
-      .map(p => {
-        const cat = catalogMap.get(String(p.modelId));
-        if (!cat) return null;
-        const rot = [0, 90, 180, 270].includes(Number(p.rotation)) ? Number(p.rotation) : 0;
-        // rotated 90/270 -> footprint axes swap for clamping
-        const halfW = ((rot % 180 === 0 ? cat.w : cat.d) / 100) / 2;
-        const halfD = ((rot % 180 === 0 ? cat.d : cat.w) / 100) / 2;
-        const minX = room.rect.x + halfW + MARGIN, maxX = room.rect.x + room.rect.w - halfW - MARGIN;
-        const minZ = room.rect.z + halfD + MARGIN, maxZ = room.rect.z + room.rect.d - halfD - MARGIN;
-        // item bigger than the room -> skip it rather than jam it in
-        if (minX > maxX || minZ > maxZ) return null;
-        let x = Math.max(minX, Math.min(maxX, Number(p.x) || 0));
-        let z = Math.max(minZ, Math.min(maxZ, Number(p.z) || 0));
+    const rect = room.rect;
+    const poly = room.polygon && room.polygon.length >= 3 ? room.polygon : null;
+    const interior: [number, number] = poly
+      ? polyCentroid(poly)
+      : [rect.x + rect.w / 2, rect.z + rect.d / 2];
 
-        // non-rectangular rooms: the bounding rect includes area outside the
-        // actual room polygon (e.g. the notch of an L-shape). If the item's
-        // center falls outside the polygon, pull it toward the room's interior
-        // until it fits; drop it if it never does.
-        if (room.polygon && room.polygon.length >= 3 && !insidePolygon(x, z, room.polygon)) {
-          const [cx, cz] = polyCentroid(room.polygon);
-          let placed = false;
-          for (let t = 0.1; t <= 1.0; t += 0.1) {
-            const nx = x + (cx - x) * t;
-            const nz = z + (cz - z) * t;
-            if (insidePolygon(nx, nz, room.polygon)) {
-              x = nx; z = nz; placed = true;
-              break;
-            }
-          }
-          if (!placed) return null;
+    /** whole footprint inside the room (rect margins + polygon corners)? */
+    const EPS = 1e-3; // 1mm float tolerance — exact-margin placements must pass
+    const fits = (x: number, z: number, hw: number, hd: number) => {
+      if (x - hw < rect.x + MARGIN - EPS || x + hw > rect.x + rect.w - MARGIN + EPS) return false;
+      if (z - hd < rect.z + MARGIN - EPS || z + hd > rect.z + rect.d - MARGIN + EPS) return false;
+      if (poly) {
+        const corners: [number, number][] = [
+          [x - hw, z - hd], [x + hw, z - hd], [x - hw, z + hd], [x + hw, z + hd],
+        ];
+        for (const [cx, cz] of corners) {
+          if (!insidePolygon(cx, cz, poly)) return false;
         }
+      }
+      return true;
+    };
 
-        return { modelId: cat.id, x, z, rotation: rot };
-      })
-      .filter(Boolean);
+    type Accepted = { modelId: string; x: number; z: number; rotation: number; hw: number; hd: number; flat: boolean };
+    const accepted: Accepted[] = [];
+    const GAP = 0.02; // 2cm breathing room between footprints
+
+    const overlapsAny = (x: number, z: number, hw: number, hd: number) =>
+      accepted.find(a =>
+        !a.flat &&
+        Math.abs(x - a.x) < hw + a.hw + GAP &&
+        Math.abs(z - a.z) < hd + a.hd + GAP,
+      );
+
+    /** last-resort placement: scan the room grid for the nearest position that
+        fits the walls and (unless flat) overlaps nothing already accepted */
+    const findSpot = (px: number, pz: number, hw: number, hd: number, flat: boolean) => {
+      const STEP = 0.2; // 20cm grid
+      let best: [number, number] | null = null;
+      let bestDist = Infinity;
+      for (let x = rect.x + hw + MARGIN; x <= rect.x + rect.w - hw - MARGIN + 1e-9; x += STEP) {
+        for (let z = rect.z + hd + MARGIN; z <= rect.z + rect.d - hd - MARGIN + 1e-9; z += STEP) {
+          if (!fits(x, z, hw, hd)) continue;
+          if (!flat && overlapsAny(x, z, hw, hd)) continue;
+          const d = (x - px) ** 2 + (z - pz) ** 2;
+          if (d < bestDist) { bestDist = d; best = [x, z]; }
+        }
+      }
+      return best;
+    };
+
+    const catalogMap = new Map(catalog.map(c => [c.id, c]));
+    for (const p of (parsed.placements as any[]).slice(0, 15)) {
+      const cat = catalogMap.get(String(p.modelId));
+      if (!cat) continue;
+      const rot = [0, 90, 180, 270].includes(Number(p.rotation)) ? Number(p.rotation) : 0;
+      const hw = ((rot % 180 === 0 ? cat.w : cat.d) / 100) / 2;
+      const hd = ((rot % 180 === 0 ? cat.d : cat.w) / 100) / 2;
+      const flat = (cat.h ?? 100) <= 5; // rugs etc: no collision either way
+      let x = Number(p.x) || interior[0];
+      let z = Number(p.z) || interior[1];
+
+      // 1) wall containment: pull toward the room interior until the whole
+      //    footprint fits; drop if it never does (item too big / bad room)
+      if (!fits(x, z, hw, hd)) {
+        let ok = false;
+        for (let t = 0.05; t <= 1.0; t += 0.05) {
+          const nx = x + (interior[0] - x) * t;
+          const nz = z + (interior[1] - z) * t;
+          if (fits(nx, nz, hw, hd)) { x = nx; z = nz; ok = true; break; }
+        }
+        if (!ok) {
+          // e.g. an L-shaped room where the pull path never clears the notch —
+          // scan for the nearest position anywhere in the room instead
+          const spot = findSpot(x, z, hw, hd, flat);
+          if (!spot) continue;
+          [x, z] = spot; ok = true;
+        }
+      }
+
+      // 2) collision resolution: push out of overlapping neighbours along the
+      //    minimal-separation axis, re-checking walls after every push
+      let placed = flat || !overlapsAny(x, z, hw, hd);
+      if (!placed) {
+        for (let attempt = 0; attempt < 8 && !placed; attempt++) {
+          const hit = overlapsAny(x, z, hw, hd)!;
+          const pushX = (hw + hit.hw + GAP) - Math.abs(x - hit.x);
+          const pushZ = (hd + hit.hd + GAP) - Math.abs(z - hit.z);
+          const candidates: [number, number][] = pushX <= pushZ
+            ? [[x + Math.sign(x - hit.x || 1) * pushX, z], [x - Math.sign(x - hit.x || 1) * pushX, z],
+               [x, z + Math.sign(z - hit.z || 1) * pushZ], [x, z - Math.sign(z - hit.z || 1) * pushZ]]
+            : [[x, z + Math.sign(z - hit.z || 1) * pushZ], [x, z - Math.sign(z - hit.z || 1) * pushZ],
+               [x + Math.sign(x - hit.x || 1) * pushX, z], [x - Math.sign(x - hit.x || 1) * pushX, z]];
+          const next = candidates.find(([nx, nz]) => fits(nx, nz, hw, hd));
+          if (!next) break;
+          [x, z] = next;
+          placed = !overlapsAny(x, z, hw, hd);
+        }
+        if (!placed) {
+          const spot = findSpot(x, z, hw, hd, flat);
+          if (spot) { [x, z] = spot; placed = true; }
+        }
+      }
+      if (!placed) continue;
+
+      accepted.push({ modelId: cat.id, x, z, rotation: rot, hw, hd, flat });
+    }
+
+    const placements = accepted.map(({ modelId, x, z, rotation }) => ({ modelId, x, z, rotation }));
 
     if (placements.length === 0) {
       return res.status(422).json({ success: false, error: 'No suitable furniture fit that room - try a different request.' });
