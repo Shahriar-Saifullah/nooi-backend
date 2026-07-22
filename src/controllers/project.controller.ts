@@ -1012,7 +1012,11 @@ export async function aiFurnish(req: AuthRequest, res: Response) {
     const projectId = String(req.params.id);
     const { command, rooms, catalog, existing } = req.body as {
       command: string;
-      rooms: { id: string; name: string; rect: { x: number; z: number; w: number; d: number } }[];
+      rooms: {
+        id: string; name: string;
+        rect: { x: number; z: number; w: number; d: number };
+        polygon?: [number, number][];
+      }[];
       catalog: { id: string; name: string; category: string; w: number; d: number }[];
       existing?: { name: string; x: number; z: number }[];
     };
@@ -1046,6 +1050,7 @@ TASK: Identify which room the user means (match names loosely — "master bedroo
 - sofas facing coffee tables/TV, rug under or in front of seating
 - dining chairs around dining tables
 - leave walking clearance; nothing outside the room; nothing overlapping
+- some rooms are non-rectangular (an L-shape's bounding rect includes area outside the room) — when in doubt keep items closer to the room's center
 - positions are the CENTER of each item, in world meters
 - rotation in degrees, one of 0, 90, 180, 270 (rotation about the vertical axis; at 0 the item's w spans the x axis)
 
@@ -1073,6 +1078,25 @@ If no room matches the command, respond: {"error": "<short explanation>"}`;
       return res.status(502).json({ success: false, error: 'AI response did not match the floor plan - try again.' });
     }
 
+    // ray-casting point-in-polygon test (world coords)
+    const insidePolygon = (x: number, z: number, poly: [number, number][]) => {
+      let inside = false;
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const [xi, zi] = poly[i], [xj, zj] = poly[j];
+        if ((zi > z) !== (zj > z) && x < ((xj - xi) * (z - zi)) / (zj - zi) + xi) {
+          inside = !inside;
+        }
+      }
+      return inside;
+    };
+    const polyCentroid = (poly: [number, number][]): [number, number] => {
+      const n = poly.length;
+      return [
+        poly.reduce((s, p) => s + p[0], 0) / n,
+        poly.reduce((s, p) => s + p[1], 0) / n,
+      ];
+    };
+
     const catalogMap = new Map(catalog.map(c => [c.id, c]));
     const MARGIN = 0.05; // 5cm off the walls minimum
     const placements = (parsed.placements as any[])
@@ -1088,12 +1112,28 @@ If no room matches the command, respond: {"error": "<short explanation>"}`;
         const minZ = room.rect.z + halfD + MARGIN, maxZ = room.rect.z + room.rect.d - halfD - MARGIN;
         // item bigger than the room -> skip it rather than jam it in
         if (minX > maxX || minZ > maxZ) return null;
-        return {
-          modelId: cat.id,
-          x: Math.max(minX, Math.min(maxX, Number(p.x) || 0)),
-          z: Math.max(minZ, Math.min(maxZ, Number(p.z) || 0)),
-          rotation: rot,
-        };
+        let x = Math.max(minX, Math.min(maxX, Number(p.x) || 0));
+        let z = Math.max(minZ, Math.min(maxZ, Number(p.z) || 0));
+
+        // non-rectangular rooms: the bounding rect includes area outside the
+        // actual room polygon (e.g. the notch of an L-shape). If the item's
+        // center falls outside the polygon, pull it toward the room's interior
+        // until it fits; drop it if it never does.
+        if (room.polygon && room.polygon.length >= 3 && !insidePolygon(x, z, room.polygon)) {
+          const [cx, cz] = polyCentroid(room.polygon);
+          let placed = false;
+          for (let t = 0.1; t <= 1.0; t += 0.1) {
+            const nx = x + (cx - x) * t;
+            const nz = z + (cz - z) * t;
+            if (insidePolygon(nx, nz, room.polygon)) {
+              x = nx; z = nz; placed = true;
+              break;
+            }
+          }
+          if (!placed) return null;
+        }
+
+        return { modelId: cat.id, x, z, rotation: rot };
       })
       .filter(Boolean);
 
