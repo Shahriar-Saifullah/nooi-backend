@@ -1000,3 +1000,117 @@ export async function getSharedProject(req: Request, res: Response) {
     return res.status(500).json({ success: false, error: err.message });
   }
 }
+
+// ─── AI furnish: natural-language furniture placement ────────────────────────
+// POST /projects/:id/ai-furnish
+// The frontend sends room rectangles in WORLD coordinates (meters, plan
+// centered on the origin) plus a compact catalog summary; Gemini picks a
+// room + layout; we validate ids and clamp every item inside the room.
+export async function aiFurnish(req: AuthRequest, res: Response) {
+  try {
+    const userId    = req.user!.id;
+    const projectId = String(req.params.id);
+    const { command, rooms, catalog, existing } = req.body as {
+      command: string;
+      rooms: { id: string; name: string; rect: { x: number; z: number; w: number; d: number } }[];
+      catalog: { id: string; name: string; category: string; w: number; d: number }[];
+      existing?: { name: string; x: number; z: number }[];
+    };
+
+    const project = await verifyOwnership(projectId, userId);
+    if (!project) {
+      return res.status(404).json({ success: false, error: 'Project not found' });
+    }
+
+    const geminiKey = process.env.GEMINI_API_KEY || '';
+    if (!geminiKey) {
+      return res.status(503).json({ success: false, error: 'AI service not configured' });
+    }
+
+    const prompt = `You are an expert interior designer placing furniture on a floor plan.
+
+USER COMMAND: "${command}"
+
+ROOMS (world coordinates in meters; rect = {x: left edge, z: top edge, w: width along x, d: depth along z}; +x is right, +z is down when viewed from above):
+${JSON.stringify(rooms)}
+
+AVAILABLE FURNITURE CATALOG (footprint in cm, w = width, d = depth):
+${JSON.stringify(catalog)}
+
+EXISTING FURNITURE ALREADY PLACED (do not overlap these):
+${JSON.stringify(existing ?? [])}
+
+TASK: Identify which room the user means (match names loosely — "master bedroom" matches "MASTER BED RM"). Choose 4-10 appropriate catalog items for that room type and the user's wishes, and lay them out realistically:
+- beds centered against a wall, nightstands flanking the bed
+- wardrobes/dressers/bookshelves/TV stands flat against walls
+- sofas facing coffee tables/TV, rug under or in front of seating
+- dining chairs around dining tables
+- leave walking clearance; nothing outside the room; nothing overlapping
+- positions are the CENTER of each item, in world meters
+- rotation in degrees, one of 0, 90, 180, 270 (rotation about the vertical axis; at 0 the item's w spans the x axis)
+
+Respond with ONLY a JSON object, no markdown fences, in exactly this shape:
+{"targetRoomId": "<room id>", "message": "<one friendly sentence describing what you placed>", "placements": [{"modelId": "<catalog id>", "x": <number>, "z": <number>, "rotation": 0}]}
+If no room matches the command, respond: {"error": "<short explanation>"}`;
+
+    const { GoogleGenerativeAI } = await import('@google/generative-ai');
+    const genAI = new GoogleGenerativeAI(geminiKey);
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    const result = await model.generateContent(prompt);
+    const raw = result.response.text().replace(/```json|```/g, '').trim();
+
+    let parsed: any;
+    try { parsed = JSON.parse(raw); }
+    catch {
+      return res.status(502).json({ success: false, error: 'AI returned an unreadable layout - try rephrasing.' });
+    }
+    if (parsed.error) {
+      return res.status(422).json({ success: false, error: String(parsed.error) });
+    }
+
+    const room = rooms.find(r => r.id === parsed.targetRoomId);
+    if (!room || !Array.isArray(parsed.placements)) {
+      return res.status(502).json({ success: false, error: 'AI response did not match the floor plan - try again.' });
+    }
+
+    const catalogMap = new Map(catalog.map(c => [c.id, c]));
+    const MARGIN = 0.05; // 5cm off the walls minimum
+    const placements = (parsed.placements as any[])
+      .slice(0, 15)
+      .map(p => {
+        const cat = catalogMap.get(String(p.modelId));
+        if (!cat) return null;
+        const rot = [0, 90, 180, 270].includes(Number(p.rotation)) ? Number(p.rotation) : 0;
+        // rotated 90/270 -> footprint axes swap for clamping
+        const halfW = ((rot % 180 === 0 ? cat.w : cat.d) / 100) / 2;
+        const halfD = ((rot % 180 === 0 ? cat.d : cat.w) / 100) / 2;
+        const minX = room.rect.x + halfW + MARGIN, maxX = room.rect.x + room.rect.w - halfW - MARGIN;
+        const minZ = room.rect.z + halfD + MARGIN, maxZ = room.rect.z + room.rect.d - halfD - MARGIN;
+        // item bigger than the room -> skip it rather than jam it in
+        if (minX > maxX || minZ > maxZ) return null;
+        return {
+          modelId: cat.id,
+          x: Math.max(minX, Math.min(maxX, Number(p.x) || 0)),
+          z: Math.max(minZ, Math.min(maxZ, Number(p.z) || 0)),
+          rotation: rot,
+        };
+      })
+      .filter(Boolean);
+
+    if (placements.length === 0) {
+      return res.status(422).json({ success: false, error: 'No suitable furniture fit that room - try a different request.' });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        targetRoomId: room.id,
+        targetRoomName: room.name,
+        message: typeof parsed.message === 'string' ? parsed.message : 'Furniture placed.',
+        placements,
+      },
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+}
