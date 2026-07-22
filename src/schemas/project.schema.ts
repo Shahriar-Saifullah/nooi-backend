@@ -136,6 +136,7 @@ export const aiFurnishSchema = z.object({
     id: z.string(),
     name: z.string(),
     rect: z.object({ x: z.number(), z: z.number(), w: z.number(), d: z.number() }),
+    polygon: z.array(z.tuple([z.number(), z.number()])).min(3).max(200).optional(),
   })).min(1).max(40),
   catalog: z.array(z.object({
     id: z.string(),
