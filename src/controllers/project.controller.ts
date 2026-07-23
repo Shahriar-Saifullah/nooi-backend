@@ -529,7 +529,10 @@ export async function saveFurniture(req: AuthRequest, res: Response) {
   try {
     const userId    = req.user!.id;
     const projectId = String(req.params.id);
-    const { furniture } = req.body as { furniture: unknown[] };
+    const { furniture, wall_colors } = req.body as {
+      furniture: unknown[];
+      wall_colors?: Record<string, string>;
+    };
 
     const project = await verifyOwnership(projectId, userId);
     if (!project) {
@@ -543,6 +546,7 @@ export async function saveFurniture(req: AuthRequest, res: Response) {
         room_data: {
           ...existing,
           furniture,
+          ...(wall_colors !== undefined ? { wall_colors } : {}),
         },
         updated_at: new Date().toISOString(),
       })
