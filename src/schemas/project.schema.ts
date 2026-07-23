@@ -122,6 +122,8 @@ export const furnitureItemSchema = z.object({
 
 export const saveFurnitureSchema = z.object({
   furniture: z.array(furnitureItemSchema).max(300),
+  // per-side wall paint: "wallKey:A" | "wallKey:B" → css color
+  wall_colors: z.record(z.string(), z.string().max(24)).optional(),
 });
 
 // ── Sharing ──────────────────────────────────────────────────────────────────
