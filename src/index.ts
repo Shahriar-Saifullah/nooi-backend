@@ -31,7 +31,7 @@ const allowedOrigins = process.env.FRONTEND_URL
   ? process.env.FRONTEND_URL.split(',').map(url => url.trim())
   : [];
 app.use(cors({ origin: allowedOrigins, credentials: true }));
-app.use(express.json());
+app.use(express.json({ limit: '12mb' })); // scene captures for the render engine arrive as base64
 app.use(cookieParser());
 
 // Health check
@@ -45,9 +45,6 @@ app.use('/projects', projectRoutes);
 app.use('/ai', aiRoutes);
 app.use('/orders', orderRoutes);
 app.use('/onboarding', onboardingRoutes);
-
-
-
 app.use('/profile', profileRoutes);
 app.use('/shared', sharedRoutes);
 

@@ -155,3 +155,9 @@ export const aiFurnishSchema = z.object({
   })).max(100).optional(),
 });
 export type AiFurnishInput = z.infer<typeof aiFurnishSchema>;
+
+// ── Render engine: live 3D scene → photorealistic image ──────────────────────
+export const renderSceneSchema = z.object({
+  prompt: z.string().max(500).optional(),
+  scene_image: z.string().min(100).max(12_000_000), // data URL of the capture
+});

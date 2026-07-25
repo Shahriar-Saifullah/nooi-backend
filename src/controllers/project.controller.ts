@@ -1266,3 +1266,100 @@ If no room matches the command, respond: {"error": "<short explanation>"}`;
     return res.status(500).json({ success: false, error: err.message });
   }
 }
+
+// ─── Render Engine: live 3D scene → Replicate → photorealistic image ─────────
+// POST /projects/:id/render-scene  { prompt?, scene_image (data URL) }
+// The scene capture conditions an img2img interior-design model, so the output
+// matches the user's actual layout, camera angle and wall colors.
+export async function renderScene(req: AuthRequest, res: Response) {
+  try {
+    const userId    = req.user!.id;
+    const projectId = String(req.params.id);
+    const { prompt, scene_image } = req.body as { prompt?: string; scene_image: string };
+
+    const project = await verifyOwnership(projectId, userId);
+    if (!project) {
+      return res.status(404).json({ success: false, error: 'Project not found' });
+    }
+
+    const token = process.env.REPLICATE_API_TOKEN || '';
+    if (!token) {
+      return res.status(503).json({ success: false, error: 'Render engine not configured' });
+    }
+    if (!/^data:image\/(png|jpe?g|webp);base64,/.test(scene_image)) {
+      return res.status(400).json({ success: false, error: 'Invalid scene image' });
+    }
+
+    const fullPrompt = [
+      'Photorealistic interior render. Preserve the exact room layout, camera angle, wall colors and furniture placement shown in the input image.',
+      'High-end architectural photography, natural window lighting, realistic materials and textures, 8k detail.',
+      prompt ? `Style request: ${prompt}` : '',
+    ].filter(Boolean).join(' ');
+
+    const { default: Replicate } = await import('replicate');
+    const replicate = new Replicate({ auth: token });
+
+    // Swappable without a code deploy — set REPLICATE_RENDER_MODEL to any
+    // img2img model that takes { image, prompt } (owner/name:version).
+    const model = (process.env.REPLICATE_RENDER_MODEL ||
+      'adirik/interior-design:76604baddc85b1b4616e1c6475eca080da339c8875bd4996705440484a6eac38') as `${string}/${string}:${string}`;
+
+    let output: any = null;
+    let lastErr: any = null;
+    for (let attempt = 0; attempt < 2 && output === null; attempt++) {
+      try {
+        output = await replicate.run(model, {
+          input: {
+            image: scene_image,
+            prompt: fullPrompt,
+            negative_prompt:
+              'cartoon, illustration, painting, sketch, low quality, blurry, warped walls, distorted geometry, extra rooms, watermark, text',
+            num_inference_steps: 30,
+            guidance_scale: 15,
+            prompt_strength: 0.8,
+          },
+        });
+      } catch (e: any) {
+        lastErr = e;
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+      }
+    }
+    if (output === null) {
+      console.error('Replicate render error:', lastErr);
+      return res.status(502).json({ success: false, error: 'Render engine is busy — please try again.' });
+    }
+
+    // replicate-js may return a URL string, an array of them, or FileOutput objects
+    const first = Array.isArray(output) ? output[0] : output;
+    const outUrl =
+      typeof first === 'string' ? first
+      : typeof first?.url === 'function' ? String(first.url())
+      : String(first);
+
+    const dl = await fetch(outUrl);
+    if (!dl.ok) {
+      return res.status(502).json({ success: false, error: 'Could not fetch rendered image' });
+    }
+    const buffer = Buffer.from(await dl.arrayBuffer());
+
+    // Persist to the same bucket/convention as generateRender, so scene renders
+    // get stable URLs and show up in Recent Creations alongside prompt renders.
+    const storagePath = `renders/${userId}/${projectId}-scene-${Date.now()}.png`;
+    const { error: uploadError } = await supabase.storage
+      .from('nooi-projects')
+      .upload(storagePath, buffer, { contentType: 'image/png', upsert: true });
+    if (uploadError) {
+      return res.status(500).json({ success: false, error: uploadError.message });
+    }
+    const { data: { publicUrl } } = supabase.storage
+      .from('nooi-projects')
+      .getPublicUrl(storagePath);
+
+    saveGeneration(userId, projectId, prompt || 'Scene render', publicUrl, 'replicate-interior', 'scene-render');
+
+    return res.status(200).json({ success: true, data: { image_url: publicUrl } });
+  } catch (err) {
+    console.error('Scene render error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
