@@ -1067,7 +1067,8 @@ If no room matches the command, respond: {"error": "<short explanation>"}`;
     const genAI = new GoogleGenerativeAI(geminiKey);
 
     // Gemini occasionally 503s under load ("high demand"). Retry with backoff,
-    // then fall back to the previous-generation flash model before giving up.
+    // then fall back to the previous-generation flash model, then to NVIDIA NIM
+    // (OpenAI-compatible) if a key is configured, before giving up.
     const MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash'];
     let raw: string | null = null;
     let lastErr: any = null;
@@ -1087,6 +1088,43 @@ If no room matches the command, respond: {"error": "<short explanation>"}`;
           if (!transient) break attempts; // config/auth errors: fail fast, don't hammer
           await new Promise(r => setTimeout(r, 700 * (attempt + 1)));
         }
+      }
+    }
+
+    // ── Fallback: NVIDIA NIM (build.nvidia.com), OpenAI-compatible ───────────
+    // Note: NVIDIA's hosted catalog is a free *prototyping* tier (~40 req/min);
+    // their terms reserve production serving for AI Enterprise. Fine as a
+    // last-resort fallback, not as the primary provider.
+    const nvidiaKey = process.env.NVIDIA_API_KEY || '';
+    if (raw === null && nvidiaKey) {
+      try {
+        const nvRes = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${nvidiaKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: process.env.NVIDIA_MODEL || 'meta/llama-3.3-70b-instruct',
+            messages: [
+              { role: 'system', content: 'You are an interior designer. Reply with raw JSON only — no markdown fences, no commentary.' },
+              { role: 'user', content: prompt },
+            ],
+            temperature: 0.4,
+            max_tokens: 2048,
+          }),
+        });
+        if (nvRes.ok) {
+          const nvJson: any = await nvRes.json();
+          const text = nvJson?.choices?.[0]?.message?.content;
+          if (typeof text === 'string' && text.trim()) {
+            raw = text.replace(/```json|```/g, '').trim();
+          }
+        } else {
+          lastErr = new Error(`NVIDIA NIM ${nvRes.status}`);
+        }
+      } catch (e: any) {
+        lastErr = e;
       }
     }
     if (raw === null) {
@@ -1275,7 +1313,9 @@ export async function renderScene(req: AuthRequest, res: Response) {
   try {
     const userId    = req.user!.id;
     const projectId = String(req.params.id);
-    const { prompt, scene_image } = req.body as { prompt?: string; scene_image: string };
+    const { prompt, scene_image, depth_image } = req.body as {
+      prompt?: string; scene_image: string; depth_image?: string;
+    };
 
     const project = await verifyOwnership(projectId, userId);
     if (!project) {
@@ -1290,35 +1330,63 @@ export async function renderScene(req: AuthRequest, res: Response) {
       return res.status(400).json({ success: false, error: 'Invalid scene image' });
     }
 
-    const fullPrompt = [
-      'Photorealistic interior render. Preserve the exact room layout, camera angle, wall colors and furniture placement shown in the input image.',
-      'High-end architectural photography, natural window lighting, realistic materials and textures, 8k detail.',
-      prompt ? `Style request: ${prompt}` : '',
-    ].filter(Boolean).join(' ');
+    // ── Pipeline selection ───────────────────────────────────────────────────
+    // RENDER_MODE=depth → depth-ControlNet (geometry from a depth map, full
+    //   freedom on materials/lighting; the untextured 3D look can't leak in)
+    // RENDER_MODE=color (default) → img2img on the colour capture
+    // Switching back is an env var change, not a deploy. The frontend always
+    // sends both images, so either path works at any time.
+    const useDepth = (process.env.RENDER_MODE || 'color') === 'depth' && !!depth_image;
 
     const { default: Replicate } = await import('replicate');
     const replicate = new Replicate({ auth: token });
 
-    // Swappable without a code deploy — set REPLICATE_RENDER_MODEL to any
-    // img2img model that takes { image, prompt } (owner/name:version).
-    const model = (process.env.REPLICATE_RENDER_MODEL ||
-      'adirik/interior-design:76604baddc85b1b4616e1c6475eca080da339c8875bd4996705440484a6eac38') as `${string}/${string}:${string}`;
+    let model: any;
+    let input: Record<string, unknown>;
+
+    if (useDepth) {
+      // A depth map carries no colour, so anything the user chose in 3D
+      // (wall paint, furniture finish) must be restated in words.
+      const fullPrompt = [
+        'Photorealistic interior photograph of this exact room.',
+        'Follow the depth map precisely for room geometry, camera angle and furniture placement.',
+        'High-end architectural photography, natural window light, realistic materials, physically based textures, 8k detail.',
+        prompt ? `Style: ${prompt}` : 'Style: warm contemporary interior with natural materials.',
+      ].filter(Boolean).join(' ');
+
+      model = process.env.REPLICATE_DEPTH_MODEL || 'black-forest-labs/flux-depth-dev';
+      input = {
+        control_image: depth_image,
+        prompt: fullPrompt,
+        guidance: 10,
+        num_inference_steps: 28,
+        output_format: 'png',
+      };
+    } else {
+      const fullPrompt = [
+        'Photorealistic interior render. Preserve the exact room layout, camera angle, wall colors and furniture placement shown in the input image.',
+        'High-end architectural photography, natural window lighting, realistic materials and textures, 8k detail.',
+        prompt ? `Style request: ${prompt}` : '',
+      ].filter(Boolean).join(' ');
+
+      model = process.env.REPLICATE_RENDER_MODEL ||
+        'adirik/interior-design:76604baddc85b1b4616e1c6475eca080da339c8875bd4996705440484a6eac38';
+      input = {
+        image: scene_image,
+        prompt: fullPrompt,
+        negative_prompt:
+          'cartoon, illustration, painting, sketch, low quality, blurry, warped walls, distorted geometry, extra rooms, watermark, text',
+        num_inference_steps: 30,
+        guidance_scale: 15,
+        prompt_strength: 0.8,
+      };
+    }
 
     let output: any = null;
     let lastErr: any = null;
     for (let attempt = 0; attempt < 2 && output === null; attempt++) {
       try {
-        output = await replicate.run(model, {
-          input: {
-            image: scene_image,
-            prompt: fullPrompt,
-            negative_prompt:
-              'cartoon, illustration, painting, sketch, low quality, blurry, warped walls, distorted geometry, extra rooms, watermark, text',
-            num_inference_steps: 30,
-            guidance_scale: 15,
-            prompt_strength: 0.8,
-          },
-        });
+        output = await replicate.run(model, { input });
       } catch (e: any) {
         lastErr = e;
         await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
@@ -1355,7 +1423,8 @@ export async function renderScene(req: AuthRequest, res: Response) {
       .from('nooi-projects')
       .getPublicUrl(storagePath);
 
-    saveGeneration(userId, projectId, prompt || 'Scene render', publicUrl, 'replicate-interior', 'scene-render');
+    saveGeneration(userId, projectId, prompt || 'Scene render', publicUrl,
+      useDepth ? 'replicate-flux-depth' : 'replicate-interior', 'scene-render');
 
     return res.status(200).json({ success: true, data: { image_url: publicUrl } });
   } catch (err) {
