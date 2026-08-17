@@ -1364,10 +1364,17 @@ export async function renderScene(req: AuthRequest, res: Response) {
       };
     } else {
       const fullPrompt = [
-        'Photorealistic interior render. Preserve the exact room layout, camera angle, wall colors and furniture placement shown in the input image.',
-        'High-end architectural photography, natural window lighting, realistic materials and textures, 8k detail.',
+        'Photorealistic interior photograph of THIS room. Keep the existing room shape, camera angle, window and door positions, wall colours and every piece of furniture exactly where it is — same types, same sizes, same positions.',
+        'Only upgrade materials, textures and lighting to look real: high-end architectural photography, natural window light, physically based materials, 8k detail.',
+        'Do not add, remove, move or restyle furniture. Do not add chandeliers, curtains or decor that is not already present.',
         prompt ? `Style request: ${prompt}` : '',
       ].filter(Boolean).join(' ');
+
+      // How much the model may rewrite the capture. 0.8 (the old default)
+      // preserves only the coarse layout; 0.5–0.6 keeps furniture, colours and
+      // proportions much closer. Tune with RENDER_STRENGTH — no deploy needed.
+      const strength = Number(process.env.RENDER_STRENGTH ?? 0.55);
+      const guidance = Number(process.env.RENDER_GUIDANCE ?? 12);
 
       model = process.env.REPLICATE_RENDER_MODEL ||
         'adirik/interior-design:76604baddc85b1b4616e1c6475eca080da339c8875bd4996705440484a6eac38';
@@ -1375,10 +1382,10 @@ export async function renderScene(req: AuthRequest, res: Response) {
         image: scene_image,
         prompt: fullPrompt,
         negative_prompt:
-          'cartoon, illustration, painting, sketch, low quality, blurry, warped walls, distorted geometry, extra rooms, watermark, text',
+          'different room, different layout, rearranged furniture, added furniture, removed furniture, chandelier, ornate decor, cartoon, illustration, painting, sketch, low quality, blurry, warped walls, distorted geometry, extra rooms, watermark, text',
         num_inference_steps: 30,
-        guidance_scale: 15,
-        prompt_strength: 0.8,
+        guidance_scale: Number.isFinite(guidance) ? guidance : 12,
+        prompt_strength: Number.isFinite(strength) ? Math.min(0.95, Math.max(0.2, strength)) : 0.55,
       };
     }
 
