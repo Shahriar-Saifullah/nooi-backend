@@ -529,10 +529,11 @@ export async function saveFurniture(req: AuthRequest, res: Response) {
   try {
     const userId    = req.user!.id;
     const projectId = String(req.params.id);
-    const { furniture, wall_colors, wall_surfaces } = req.body as {
+    const { furniture, wall_colors, wall_surfaces, door_finishes } = req.body as {
       furniture: unknown[];
       wall_colors?: Record<string, string>;
       wall_surfaces?: Record<string, string>;
+      door_finishes?: Record<string, string>;
     };
 
     const project = await verifyOwnership(projectId, userId);
@@ -549,6 +550,7 @@ export async function saveFurniture(req: AuthRequest, res: Response) {
           furniture,
           ...(wall_colors !== undefined ? { wall_colors } : {}),
           ...(wall_surfaces !== undefined ? { wall_surfaces } : {}),
+          ...(door_finishes !== undefined ? { door_finishes } : {}),
         },
         updated_at: new Date().toISOString(),
       })

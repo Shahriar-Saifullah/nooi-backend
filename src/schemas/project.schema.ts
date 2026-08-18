@@ -126,6 +126,8 @@ export const saveFurnitureSchema = z.object({
   wall_colors: z.record(z.string(), z.string().max(24)).optional(),
   // per-side wall surface: "wallKey:A" | "wallKey:B" → surface id
   wall_surfaces: z.record(z.string(), z.string().max(64)).optional(),
+  // per-door finish: door key → finish id
+  door_finishes: z.record(z.string(), z.string().max(64)).optional(),
 });
 
 // ── Sharing ──────────────────────────────────────────────────────────────────
