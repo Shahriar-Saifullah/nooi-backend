@@ -529,7 +529,12 @@ export async function saveFurniture(req: AuthRequest, res: Response) {
   try {
     const userId    = req.user!.id;
     const projectId = String(req.params.id);
-    const { furniture } = req.body as { furniture: unknown[] };
+    const { furniture, wall_colors, wall_surfaces, door_finishes } = req.body as {
+      furniture: unknown[];
+      wall_colors?: Record<string, string>;
+      wall_surfaces?: Record<string, string>;
+      door_finishes?: Record<string, string>;
+    };
 
     const project = await verifyOwnership(projectId, userId);
     if (!project) {
@@ -543,6 +548,9 @@ export async function saveFurniture(req: AuthRequest, res: Response) {
         room_data: {
           ...existing,
           furniture,
+          ...(wall_colors !== undefined ? { wall_colors } : {}),
+          ...(wall_surfaces !== undefined ? { wall_surfaces } : {}),
+          ...(door_finishes !== undefined ? { door_finishes } : {}),
         },
         updated_at: new Date().toISOString(),
       })
@@ -998,5 +1006,440 @@ export async function getSharedProject(req: Request, res: Response) {
     return res.json({ success: true, data: { project: data } });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err.message });
+  }
+}
+
+// ─── AI furnish: natural-language furniture placement ────────────────────────
+// POST /projects/:id/ai-furnish
+// The frontend sends room rectangles in WORLD coordinates (meters, plan
+// centered on the origin) plus a compact catalog summary; Gemini picks a
+// room + layout; we validate ids and clamp every item inside the room.
+export async function aiFurnish(req: AuthRequest, res: Response) {
+  try {
+    const userId    = req.user!.id;
+    const projectId = String(req.params.id);
+    const { command, rooms, catalog, existing } = req.body as {
+      command: string;
+      rooms: {
+        id: string; name: string;
+        rect: { x: number; z: number; w: number; d: number };
+        polygon?: [number, number][];
+      }[];
+      catalog: { id: string; name: string; category: string; w: number; d: number; h?: number }[];
+      existing?: { name: string; x: number; z: number }[];
+    };
+
+    const project = await verifyOwnership(projectId, userId);
+    if (!project) {
+      return res.status(404).json({ success: false, error: 'Project not found' });
+    }
+
+    const geminiKey = process.env.GEMINI_API_KEY || '';
+    if (!geminiKey) {
+      return res.status(503).json({ success: false, error: 'AI service not configured' });
+    }
+
+    const prompt = `You are an expert interior designer placing furniture on a floor plan.
+
+USER COMMAND: "${command}"
+
+ROOMS (world coordinates in meters; rect = {x: left edge, z: top edge, w: width along x, d: depth along z}; +x is right, +z is down when viewed from above):
+${JSON.stringify(rooms)}
+
+AVAILABLE FURNITURE CATALOG (footprint in cm, w = width, d = depth):
+${JSON.stringify(catalog)}
+
+EXISTING FURNITURE ALREADY PLACED (do not overlap these):
+${JSON.stringify(existing ?? [])}
+
+TASK: Identify which room the user means (match names loosely — "master bedroom" matches "MASTER BED RM"). Choose 4-10 appropriate catalog items for that room type and the user's wishes, and lay them out realistically:
+- beds centered against a wall, nightstands flanking the bed
+- wardrobes/dressers/bookshelves/TV stands flat against walls
+- sofas facing coffee tables/TV, rug under or in front of seating
+- dining chairs around dining tables
+- leave walking clearance; nothing outside the room; nothing overlapping
+- some rooms are non-rectangular (an L-shape's bounding rect includes area outside the room) — when in doubt keep items closer to the room's center
+- keep at least 40cm clearance between separate items (exception: rugs may sit under beds, sofas and tables)
+- positions are the CENTER of each item, in world meters
+- rotation in degrees, one of 0, 90, 180, 270 (rotation about the vertical axis; at 0 the item's w spans the x axis)
+
+Respond with ONLY a JSON object, no markdown fences, in exactly this shape:
+{"targetRoomId": "<room id>", "message": "<one friendly sentence describing what you placed>", "placements": [{"modelId": "<catalog id>", "x": <number>, "z": <number>, "rotation": 0}]}
+If no room matches the command, respond: {"error": "<short explanation>"}`;
+
+    const { GoogleGenerativeAI } = await import('@google/generative-ai');
+    const genAI = new GoogleGenerativeAI(geminiKey);
+
+    // Gemini occasionally 503s under load ("high demand"). Retry with backoff,
+    // then fall back to the previous-generation flash model, then to NVIDIA NIM
+    // (OpenAI-compatible) if a key is configured, before giving up.
+    const MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+    let raw: string | null = null;
+    let lastErr: any = null;
+    attempts: for (const modelName of MODELS) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const model = genAI.getGenerativeModel({ model: modelName });
+          const result = await model.generateContent(prompt);
+          raw = result.response.text().replace(/```json|```/g, '').trim();
+          break attempts;
+        } catch (e: any) {
+          lastErr = e;
+          const msg = String(e?.message || '');
+          const transient =
+            msg.includes('503') || msg.includes('429') ||
+            /overloaded|high demand|unavailable|fetch failed|ECONNRESET|timeout/i.test(msg);
+          if (!transient) break attempts; // config/auth errors: fail fast, don't hammer
+          await new Promise(r => setTimeout(r, 700 * (attempt + 1)));
+        }
+      }
+    }
+
+    // ── Fallback: NVIDIA NIM (build.nvidia.com), OpenAI-compatible ───────────
+    // Note: NVIDIA's hosted catalog is a free *prototyping* tier (~40 req/min);
+    // their terms reserve production serving for AI Enterprise. Fine as a
+    // last-resort fallback, not as the primary provider.
+    const nvidiaKey = process.env.NVIDIA_API_KEY || '';
+    if (raw === null && nvidiaKey) {
+      try {
+        const nvRes = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${nvidiaKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: process.env.NVIDIA_MODEL || 'meta/llama-3.3-70b-instruct',
+            messages: [
+              { role: 'system', content: 'You are an interior designer. Reply with raw JSON only — no markdown fences, no commentary.' },
+              { role: 'user', content: prompt },
+            ],
+            temperature: 0.4,
+            max_tokens: 2048,
+          }),
+        });
+        if (nvRes.ok) {
+          const nvJson: any = await nvRes.json();
+          const text = nvJson?.choices?.[0]?.message?.content;
+          if (typeof text === 'string' && text.trim()) {
+            raw = text.replace(/```json|```/g, '').trim();
+          }
+        } else {
+          lastErr = new Error(`NVIDIA NIM ${nvRes.status}`);
+        }
+      } catch (e: any) {
+        lastErr = e;
+      }
+    }
+    if (raw === null) {
+      const msg = String(lastErr?.message || '');
+      const busy = msg.includes('503') || /overloaded|high demand/i.test(msg);
+      return res.status(busy ? 503 : 502).json({
+        success: false,
+        error: busy
+          ? 'The AI is busy right now — please try again in a moment.'
+          : 'AI request failed — please try again.',
+      });
+    }
+
+    let parsed: any;
+    try { parsed = JSON.parse(raw); }
+    catch {
+      return res.status(502).json({ success: false, error: 'AI returned an unreadable layout - try rephrasing.' });
+    }
+    if (parsed.error) {
+      return res.status(422).json({ success: false, error: String(parsed.error) });
+    }
+
+    const room = rooms.find(r => r.id === parsed.targetRoomId);
+    if (!room || !Array.isArray(parsed.placements)) {
+      return res.status(502).json({ success: false, error: 'AI response did not match the floor plan - try again.' });
+    }
+
+    // ── Layout sanitizer ─────────────────────────────────────────────────────
+    // Gemini's coordinates are suggestions; geometry here is law. Each item's
+    // FULL footprint (all four corners, rotation-aware) must lie inside the
+    // room, and footprints may not overlap each other (flat items like rugs
+    // are exempt — they belong under beds and sofas).
+
+    // ray-casting point-in-polygon test (world coords)
+    const insidePolygon = (x: number, z: number, poly: [number, number][]) => {
+      let inside = false;
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const [xi, zi] = poly[i], [xj, zj] = poly[j];
+        if ((zi > z) !== (zj > z) && x < ((xj - xi) * (z - zi)) / (zj - zi) + xi) {
+          inside = !inside;
+        }
+      }
+      return inside;
+    };
+    const polyCentroid = (poly: [number, number][]): [number, number] => {
+      const n = poly.length;
+      return [
+        poly.reduce((s, p) => s + p[0], 0) / n,
+        poly.reduce((s, p) => s + p[1], 0) / n,
+      ];
+    };
+
+    const MARGIN = 0.05; // 5cm off the walls minimum
+    const rect = room.rect;
+    const poly = room.polygon && room.polygon.length >= 3 ? room.polygon : null;
+    const interior: [number, number] = poly
+      ? polyCentroid(poly)
+      : [rect.x + rect.w / 2, rect.z + rect.d / 2];
+
+    /** whole footprint inside the room (rect margins + polygon corners)? */
+    const EPS = 1e-3; // 1mm float tolerance — exact-margin placements must pass
+    const fits = (x: number, z: number, hw: number, hd: number) => {
+      if (x - hw < rect.x + MARGIN - EPS || x + hw > rect.x + rect.w - MARGIN + EPS) return false;
+      if (z - hd < rect.z + MARGIN - EPS || z + hd > rect.z + rect.d - MARGIN + EPS) return false;
+      if (poly) {
+        const corners: [number, number][] = [
+          [x - hw, z - hd], [x + hw, z - hd], [x - hw, z + hd], [x + hw, z + hd],
+        ];
+        for (const [cx, cz] of corners) {
+          if (!insidePolygon(cx, cz, poly)) return false;
+        }
+      }
+      return true;
+    };
+
+    type Accepted = { modelId: string; x: number; z: number; rotation: number; hw: number; hd: number; flat: boolean };
+    const accepted: Accepted[] = [];
+    const GAP = 0.02; // 2cm breathing room between footprints
+
+    const overlapsAny = (x: number, z: number, hw: number, hd: number) =>
+      accepted.find(a =>
+        !a.flat &&
+        Math.abs(x - a.x) < hw + a.hw + GAP &&
+        Math.abs(z - a.z) < hd + a.hd + GAP,
+      );
+
+    /** last-resort placement: scan the room grid for the nearest position that
+        fits the walls and (unless flat) overlaps nothing already accepted */
+    const findSpot = (px: number, pz: number, hw: number, hd: number, flat: boolean) => {
+      const STEP = 0.2; // 20cm grid
+      let best: [number, number] | null = null;
+      let bestDist = Infinity;
+      for (let x = rect.x + hw + MARGIN; x <= rect.x + rect.w - hw - MARGIN + 1e-9; x += STEP) {
+        for (let z = rect.z + hd + MARGIN; z <= rect.z + rect.d - hd - MARGIN + 1e-9; z += STEP) {
+          if (!fits(x, z, hw, hd)) continue;
+          if (!flat && overlapsAny(x, z, hw, hd)) continue;
+          const d = (x - px) ** 2 + (z - pz) ** 2;
+          if (d < bestDist) { bestDist = d; best = [x, z]; }
+        }
+      }
+      return best;
+    };
+
+    const catalogMap = new Map(catalog.map(c => [c.id, c]));
+    for (const p of (parsed.placements as any[]).slice(0, 15)) {
+      const cat = catalogMap.get(String(p.modelId));
+      if (!cat) continue;
+      const rot = [0, 90, 180, 270].includes(Number(p.rotation)) ? Number(p.rotation) : 0;
+      const hw = ((rot % 180 === 0 ? cat.w : cat.d) / 100) / 2;
+      const hd = ((rot % 180 === 0 ? cat.d : cat.w) / 100) / 2;
+      const flat = (cat.h ?? 100) <= 5; // rugs etc: no collision either way
+      let x = Number(p.x) || interior[0];
+      let z = Number(p.z) || interior[1];
+
+      // 1) wall containment: pull toward the room interior until the whole
+      //    footprint fits; drop if it never does (item too big / bad room)
+      if (!fits(x, z, hw, hd)) {
+        let ok = false;
+        for (let t = 0.05; t <= 1.0; t += 0.05) {
+          const nx = x + (interior[0] - x) * t;
+          const nz = z + (interior[1] - z) * t;
+          if (fits(nx, nz, hw, hd)) { x = nx; z = nz; ok = true; break; }
+        }
+        if (!ok) {
+          // e.g. an L-shaped room where the pull path never clears the notch —
+          // scan for the nearest position anywhere in the room instead
+          const spot = findSpot(x, z, hw, hd, flat);
+          if (!spot) continue;
+          [x, z] = spot; ok = true;
+        }
+      }
+
+      // 2) collision resolution: push out of overlapping neighbours along the
+      //    minimal-separation axis, re-checking walls after every push
+      let placed = flat || !overlapsAny(x, z, hw, hd);
+      if (!placed) {
+        for (let attempt = 0; attempt < 8 && !placed; attempt++) {
+          const hit = overlapsAny(x, z, hw, hd)!;
+          const pushX = (hw + hit.hw + GAP) - Math.abs(x - hit.x);
+          const pushZ = (hd + hit.hd + GAP) - Math.abs(z - hit.z);
+          const candidates: [number, number][] = pushX <= pushZ
+            ? [[x + Math.sign(x - hit.x || 1) * pushX, z], [x - Math.sign(x - hit.x || 1) * pushX, z],
+               [x, z + Math.sign(z - hit.z || 1) * pushZ], [x, z - Math.sign(z - hit.z || 1) * pushZ]]
+            : [[x, z + Math.sign(z - hit.z || 1) * pushZ], [x, z - Math.sign(z - hit.z || 1) * pushZ],
+               [x + Math.sign(x - hit.x || 1) * pushX, z], [x - Math.sign(x - hit.x || 1) * pushX, z]];
+          const next = candidates.find(([nx, nz]) => fits(nx, nz, hw, hd));
+          if (!next) break;
+          [x, z] = next;
+          placed = !overlapsAny(x, z, hw, hd);
+        }
+        if (!placed) {
+          const spot = findSpot(x, z, hw, hd, flat);
+          if (spot) { [x, z] = spot; placed = true; }
+        }
+      }
+      if (!placed) continue;
+
+      accepted.push({ modelId: cat.id, x, z, rotation: rot, hw, hd, flat });
+    }
+
+    const placements = accepted.map(({ modelId, x, z, rotation }) => ({ modelId, x, z, rotation }));
+
+    if (placements.length === 0) {
+      return res.status(422).json({ success: false, error: 'No suitable furniture fit that room - try a different request.' });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        targetRoomId: room.id,
+        targetRoomName: room.name,
+        message: typeof parsed.message === 'string' ? parsed.message : 'Furniture placed.',
+        placements,
+      },
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+}
+
+// ─── Render Engine: live 3D scene → Replicate → photorealistic image ─────────
+// POST /projects/:id/render-scene  { prompt?, scene_image (data URL) }
+// The scene capture conditions an img2img interior-design model, so the output
+// matches the user's actual layout, camera angle and wall colors.
+export async function renderScene(req: AuthRequest, res: Response) {
+  try {
+    const userId    = req.user!.id;
+    const projectId = String(req.params.id);
+    const { prompt, scene_image, depth_image } = req.body as {
+      prompt?: string; scene_image: string; depth_image?: string;
+    };
+
+    const project = await verifyOwnership(projectId, userId);
+    if (!project) {
+      return res.status(404).json({ success: false, error: 'Project not found' });
+    }
+
+    const token = process.env.REPLICATE_API_TOKEN || '';
+    if (!token) {
+      return res.status(503).json({ success: false, error: 'Render engine not configured' });
+    }
+    if (!/^data:image\/(png|jpe?g|webp);base64,/.test(scene_image)) {
+      return res.status(400).json({ success: false, error: 'Invalid scene image' });
+    }
+
+    // ── Pipeline selection ───────────────────────────────────────────────────
+    // RENDER_MODE=depth → depth-ControlNet (geometry from a depth map, full
+    //   freedom on materials/lighting; the untextured 3D look can't leak in)
+    // RENDER_MODE=color (default) → img2img on the colour capture
+    // Switching back is an env var change, not a deploy. The frontend always
+    // sends both images, so either path works at any time.
+    const useDepth = (process.env.RENDER_MODE || 'color') === 'depth' && !!depth_image;
+
+    const { default: Replicate } = await import('replicate');
+    const replicate = new Replicate({ auth: token });
+
+    let model: any;
+    let input: Record<string, unknown>;
+
+    if (useDepth) {
+      // A depth map carries no colour, so anything the user chose in 3D
+      // (wall paint, furniture finish) must be restated in words.
+      const fullPrompt = [
+        'Photorealistic interior photograph of this exact room.',
+        'Follow the depth map precisely for room geometry, camera angle and furniture placement.',
+        'High-end architectural photography, natural window light, realistic materials, physically based textures, 8k detail.',
+        prompt ? `Style: ${prompt}` : 'Style: warm contemporary interior with natural materials.',
+      ].filter(Boolean).join(' ');
+
+      model = process.env.REPLICATE_DEPTH_MODEL || 'black-forest-labs/flux-depth-dev';
+      input = {
+        control_image: depth_image,
+        prompt: fullPrompt,
+        guidance: 10,
+        num_inference_steps: 28,
+        output_format: 'png',
+      };
+    } else {
+      const fullPrompt = [
+        'Photorealistic interior photograph of THIS room. Keep the existing room shape, camera angle, window and door positions, wall colours and every piece of furniture exactly where it is — same types, same sizes, same positions.',
+        'Only upgrade materials, textures and lighting to look real: high-end architectural photography, natural window light, physically based materials, 8k detail.',
+        'Do not add, remove, move or restyle furniture. Do not add chandeliers, curtains or decor that is not already present.',
+        prompt ? `Style request: ${prompt}` : '',
+      ].filter(Boolean).join(' ');
+
+      // How much the model may rewrite the capture. 0.8 (the old default)
+      // preserves only the coarse layout; 0.5–0.6 keeps furniture, colours and
+      // proportions much closer. Tune with RENDER_STRENGTH — no deploy needed.
+      const strength = Number(process.env.RENDER_STRENGTH ?? 0.55);
+      const guidance = Number(process.env.RENDER_GUIDANCE ?? 12);
+
+      model = process.env.REPLICATE_RENDER_MODEL ||
+        'adirik/interior-design:76604baddc85b1b4616e1c6475eca080da339c8875bd4996705440484a6eac38';
+      input = {
+        image: scene_image,
+        prompt: fullPrompt,
+        negative_prompt:
+          'different room, different layout, rearranged furniture, added furniture, removed furniture, chandelier, ornate decor, cartoon, illustration, painting, sketch, low quality, blurry, warped walls, distorted geometry, extra rooms, watermark, text',
+        num_inference_steps: 30,
+        guidance_scale: Number.isFinite(guidance) ? guidance : 12,
+        prompt_strength: Number.isFinite(strength) ? Math.min(0.95, Math.max(0.2, strength)) : 0.55,
+      };
+    }
+
+    let output: any = null;
+    let lastErr: any = null;
+    for (let attempt = 0; attempt < 2 && output === null; attempt++) {
+      try {
+        output = await replicate.run(model, { input });
+      } catch (e: any) {
+        lastErr = e;
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+      }
+    }
+    if (output === null) {
+      console.error('Replicate render error:', lastErr);
+      return res.status(502).json({ success: false, error: 'Render engine is busy — please try again.' });
+    }
+
+    // replicate-js may return a URL string, an array of them, or FileOutput objects
+    const first = Array.isArray(output) ? output[0] : output;
+    const outUrl =
+      typeof first === 'string' ? first
+      : typeof first?.url === 'function' ? String(first.url())
+      : String(first);
+
+    const dl = await fetch(outUrl);
+    if (!dl.ok) {
+      return res.status(502).json({ success: false, error: 'Could not fetch rendered image' });
+    }
+    const buffer = Buffer.from(await dl.arrayBuffer());
+
+    // Persist to the same bucket/convention as generateRender, so scene renders
+    // get stable URLs and show up in Recent Creations alongside prompt renders.
+    const storagePath = `renders/${userId}/${projectId}-scene-${Date.now()}.png`;
+    const { error: uploadError } = await supabase.storage
+      .from('nooi-projects')
+      .upload(storagePath, buffer, { contentType: 'image/png', upsert: true });
+    if (uploadError) {
+      return res.status(500).json({ success: false, error: uploadError.message });
+    }
+    const { data: { publicUrl } } = supabase.storage
+      .from('nooi-projects')
+      .getPublicUrl(storagePath);
+
+    saveGeneration(userId, projectId, prompt || 'Scene render', publicUrl,
+      useDepth ? 'replicate-flux-depth' : 'replicate-interior', 'scene-render');
+
+    return res.status(200).json({ success: true, data: { image_url: publicUrl } });
+  } catch (err) {
+    console.error('Scene render error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }

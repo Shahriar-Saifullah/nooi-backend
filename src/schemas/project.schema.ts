@@ -122,9 +122,48 @@ export const furnitureItemSchema = z.object({
 
 export const saveFurnitureSchema = z.object({
   furniture: z.array(furnitureItemSchema).max(300),
+  // per-side wall paint: "wallKey:A" | "wallKey:B" → css color
+  wall_colors: z.record(z.string(), z.string().max(24)).optional(),
+  // per-side wall surface: "wallKey:A" | "wallKey:B" → surface id
+  wall_surfaces: z.record(z.string(), z.string().max(64)).optional(),
+  // per-door finish: door key → finish id
+  door_finishes: z.record(z.string(), z.string().max(64)).optional(),
 });
 
 // ── Sharing ──────────────────────────────────────────────────────────────────
 export const toggleShareSchema = z.object({
   enabled: z.boolean(),
+});
+
+// ── AI furnish (natural-language furniture placement) ────────────────────────
+export const aiFurnishSchema = z.object({
+  command: z.string().min(3).max(500),
+  rooms: z.array(z.object({
+    id: z.string(),
+    name: z.string(),
+    rect: z.object({ x: z.number(), z: z.number(), w: z.number(), d: z.number() }),
+    polygon: z.array(z.tuple([z.number(), z.number()])).min(3).max(200).optional(),
+  })).min(1).max(40),
+  catalog: z.array(z.object({
+    id: z.string(),
+    name: z.string(),
+    category: z.string(),
+    w: z.number(),   // footprint cm
+    d: z.number(),
+    h: z.number().optional(),   // height cm — flat items (rugs) skip collision
+  })).min(1).max(80),
+  existing: z.array(z.object({
+    name: z.string(),
+    x: z.number(),
+    z: z.number(),
+  })).max(100).optional(),
+});
+export type AiFurnishInput = z.infer<typeof aiFurnishSchema>;
+
+// ── Render engine: live 3D scene → photorealistic image ──────────────────────
+export const renderSceneSchema = z.object({
+  prompt: z.string().max(500).optional(),
+  scene_image: z.string().min(100).max(12_000_000), // data URL of the capture
+  // grayscale depth map of the same view; used when RENDER_MODE=depth
+  depth_image: z.string().min(100).max(12_000_000).optional(),
 });
