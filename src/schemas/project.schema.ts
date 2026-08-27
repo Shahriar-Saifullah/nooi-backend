@@ -114,6 +114,7 @@ export const furnitureItemSchema = z.object({
   sizeScale:      z.number().min(0.2).max(4).optional(),
   color:          z.string().nullable().optional(),
   materialPreset: z.string().nullable().optional(),
+  mountType:      z.enum(["floor", "ceiling", "wall"]).optional(),
   scale:          z.tuple([z.number(), z.number(), z.number()]).optional(),
   width:          z.number().optional(),
   depth:          z.number().optional(),
