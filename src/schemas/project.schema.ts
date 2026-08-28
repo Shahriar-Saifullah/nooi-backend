@@ -114,6 +114,9 @@ export const furnitureItemSchema = z.object({
   sizeScale:      z.number().min(0.2).max(4).optional(),
   color:          z.string().nullable().optional(),
   materialPreset: z.string().nullable().optional(),
+  // Ceiling/wall mounts. Zod strips unknown keys silently, so omitting this
+  // meant every save quietly dropped the flag and chandeliers fell to the
+  // floor on reload.
   mountType:      z.enum(["floor", "ceiling", "wall"]).optional(),
   scale:          z.tuple([z.number(), z.number(), z.number()]).optional(),
   width:          z.number().optional(),
@@ -168,3 +171,25 @@ export const renderSceneSchema = z.object({
   // grayscale depth map of the same view; used when RENDER_MODE=depth
   depth_image: z.string().min(100).max(12_000_000).optional(),
 });
+
+// ── NOOI-10: wall editing ────────────────────────────────────────────────────
+// Walls were only ever written by the floor-plan analysis, so an edited layout
+// had nowhere to persist. Openings travel with them: moving a wall must move
+// its doors and windows, and saving one without the other leaves the plan
+// inconsistent.
+export const saveWallsSchema = z.object({
+  walls: z.array(z.object({
+    x1: z.number(), y1: z.number(),
+    x2: z.number(), y2: z.number(),
+    thickness: z.number().min(0).max(50),
+    id: z.string().max(64).optional(),
+  })).max(400),
+  openings: z.array(z.object({
+    type: z.enum(["door", "window"]),
+    wall: z.enum(["horizontal", "vertical"]),
+    x: z.number(), y: z.number(),
+    width: z.number(),
+    wall_id: z.string().max(64).optional(),
+  })).max(400).optional(),
+});
+export type SaveWallsInput = z.infer<typeof saveWallsSchema>;
