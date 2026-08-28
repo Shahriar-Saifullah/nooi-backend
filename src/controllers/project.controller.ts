@@ -1443,3 +1443,45 @@ export async function renderScene(req: AuthRequest, res: Response) {
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }
+
+// ─── NOOI-10: persist an edited wall layout ──────────────────────────────────
+// PUT /projects/:id/walls  { walls, openings? }
+export async function saveWalls(req: AuthRequest, res: Response) {
+  try {
+    const userId    = req.user!.id;
+    const projectId = String(req.params.id);
+    const { walls, openings } = req.body as {
+      walls: unknown[];
+      openings?: unknown[];
+    };
+
+    const project = await verifyOwnership(projectId, userId);
+    if (!project) {
+      return res.status(404).json({ success: false, error: 'Project not found' });
+    }
+
+    const existing = (project as any).room_data ?? {};
+    const { data, error } = await supabase
+      .from('projects')
+      .update({
+        room_data: {
+          ...existing,
+          walls,
+          // only replace openings when the client sends them — a caller that
+          // edits walls alone should not silently wipe every door and window
+          ...(openings !== undefined ? { openings } : {}),
+        },
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', projectId)
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+    return res.json({ success: true, data: { room_data: data.room_data } });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+}
