@@ -6,6 +6,8 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 
 import authRoutes     from './routes/auth.routes';
+import vendorRoutes   from './routes/vendor.routes';
+import adminRoutes    from './routes/admin.routes';
 import projectRoutes from './routes/projects.routes';
 import aiRoutes       from './routes/ai.routes';
 import orderRoutes    from './routes/orders.routes';
@@ -41,6 +43,8 @@ app.get('/health', (req, res) => {
 
 // Routes
 app.use('/auth', authRoutes);
+app.use('/vendor', vendorRoutes);
+app.use('/admin', adminRoutes);
 app.use('/projects', projectRoutes);
 app.use('/ai', aiRoutes);
 app.use('/orders', orderRoutes);
