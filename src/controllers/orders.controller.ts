@@ -1,13 +1,14 @@
-import { Request, Response } from 'express';
+﻿import { Request, Response } from 'express';
 import { supabase } from '../services/supabase';
+import { AuthRequest } from '../types';
 
 // Mock order storage for fallback / demonstration
 const MOCK_ORDERS: any[] = [];
 
 export const createOrderCheckout = async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).user?.id || 'guest-user';
-    const { items, shipping_address, subtotal, tax_amount = 0, shipping_amount = 0, total_amount } = req.body;
+    const userId = (req as AuthRequest).user?.id || 'guest-user';
+    const { items, shipping_address, subtotal, tax_amount = 0, shipping_amount = 0, total_amount, payment_method = 'stripe' } = req.body;
 
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ success: false, message: 'Cart items are required' });
@@ -20,7 +21,9 @@ export const createOrderCheckout = async (req: Request, res: Response) => {
       id: `ord-${Date.now()}`,
       order_number: orderNumber,
       user_id: userId,
-      status: 'paid', // Direct approval bypassing payment gateway per user directive
+      status: 'paid', // Direct approval / draft checkout
+      payment_method,
+      payment_status: 'succeeded',
       subtotal: subtotal || 1550.00,
       tax_amount,
       shipping_amount,
@@ -63,6 +66,8 @@ export const createOrderCheckout = async (req: Request, res: Response) => {
         order_number: orderNumber,
         user_id: userId !== 'guest-user' ? userId : null,
         status: 'paid',
+        payment_method,
+        payment_status: 'succeeded',
         subtotal: newOrder.subtotal,
         tax_amount: newOrder.tax_amount,
         shipping_amount: newOrder.shipping_amount,
@@ -92,7 +97,11 @@ export const createOrderCheckout = async (req: Request, res: Response) => {
 
 export const getUserOrders = async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).user?.id;
+    const userId = (req as AuthRequest).user?.id;
+
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'Authentication required' });
+    }
 
     const { data, error } = await supabase
       .from('orders')
@@ -101,7 +110,8 @@ export const getUserOrders = async (req: Request, res: Response) => {
       .order('created_at', { ascending: false });
 
     if (error || !data || data.length === 0) {
-      return res.json({ success: true, orders: MOCK_ORDERS, is_mock: true });
+      const userMocks = MOCK_ORDERS.filter(o => o.user_id === userId);
+      return res.json({ success: true, orders: userMocks, is_mock: true });
     }
 
     return res.json({ success: true, orders: data, is_mock: false });
@@ -113,6 +123,9 @@ export const getUserOrders = async (req: Request, res: Response) => {
 export const getOrderById = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.id;
+    const userRole = authReq.userProfile?.role || 'user';
 
     const { data, error } = await supabase
       .from('orders')
@@ -121,8 +134,20 @@ export const getOrderById = async (req: Request, res: Response) => {
       .single();
 
     if (error || !data) {
-      const match = MOCK_ORDERS.find(o => o.id === id || o.order_number === id) || MOCK_ORDERS[0];
+      const match = MOCK_ORDERS.find(o => o.id === id || o.order_number === id);
+      if (!match) {
+        return res.status(404).json({ success: false, error: 'Order not found' });
+      }
+      // Access check
+      if (match.user_id !== userId && userRole !== 'admin' && userRole !== 'super_admin') {
+        return res.status(403).json({ success: false, error: 'Access denied to this order' });
+      }
       return res.json({ success: true, order: match, is_mock: true });
+    }
+
+    // Access check: User must own the order OR be admin/super_admin
+    if (data.user_id !== userId && userRole !== 'admin' && userRole !== 'super_admin') {
+      return res.status(403).json({ success: false, error: 'Access denied: You do not have permission to view this order' });
     }
 
     return res.json({ success: true, order: data, is_mock: false });
@@ -135,7 +160,11 @@ export const submitReturnRequest = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { reason, photo_urls = [], order_item_id } = req.body;
-    const userId = (req as any).user?.id || 'guest-user';
+    const userId = (req as AuthRequest).user?.id;
+
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'Authentication required' });
+    }
 
     const returnRecord = {
       id: `ret-${Date.now()}`,
