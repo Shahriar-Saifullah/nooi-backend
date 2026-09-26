@@ -109,7 +109,8 @@ const MOCK_PRODUCTS = [
 
 export const getProducts = async (req: Request, res: Response) => {
   try {
-    const { category, search, min_price, max_price, sort, page = 1, limit = 12 } = req.query;
+    const { category, search, min_price, max_price, sort, page = 1, limit = 12,
+      type_id, exclude_model } = req.query;
 
     let query = supabase
       .from('products')
@@ -117,6 +118,13 @@ export const getProducts = async (req: Request, res: Response) => {
 
     if (category && category !== 'All') {
       query = query.ilike('category', `%${category}%`);
+    }
+
+    if (type_id) {
+      query = query.eq('type_id', String(type_id));
+    }
+    if (exclude_model) {
+      query = query.neq('canvas_model_id', String(exclude_model));
     }
 
     if (search) {
