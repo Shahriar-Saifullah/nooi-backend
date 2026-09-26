@@ -198,7 +198,7 @@ export const getProductById = async (req: Request, res: Response) => {
 
     const { data, error } = await supabase
       .from('products')
-      .select('*, retailers(*), product_variants(*), product_reviews(*)')
+      .select('*, retailers(id, name, logo_url), product_variants(*), product_reviews(*)')
       .eq('id', id)
       .single();
 
@@ -256,9 +256,15 @@ export const getCanvasProductLink = async (req: Request, res: Response) => {
 
     const { data, error } = await supabase
       .from('products')
-      .select('*, retailers(*), product_variants(*)')
+      .select(`
+      id, retailer_id, canvas_model_id, type_id, title, description,
+      category, tags, base_price, affiliate_url, specs_json,
+      retailers(id, name, logo_url),
+      product_variants(*)
+      `)
       .eq('canvas_model_id', canvasModelId);
 
+    if (error) console.error('[canvas-link] query failed:', error);
     if (error || !data || data.length === 0) {
       const matching = MOCK_PRODUCTS.filter(p => p.canvas_model_id === canvasModelId || p.canvas_model_id.includes('sofa'));
       return res.json({ success: true, products: matching.length ? matching : [MOCK_PRODUCTS[0]], is_mock: true });
