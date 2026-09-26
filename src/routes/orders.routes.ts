@@ -1,6 +1,7 @@
 ﻿import { Router } from 'express';
 import {
-  createOrderCheckout,
+  createPaymentIntent,
+  getOrderByPaymentIntent,
   getUserOrders,
   getOrderById,
   submitReturnRequest,
@@ -9,7 +10,11 @@ import { requireAuth } from '../middleware/auth.middleware';
 
 const router = Router();
 
-router.post('/checkout', createOrderCheckout);
+// Phase 03 Commerce Routes
+router.post('/create-payment-intent', requireAuth, createPaymentIntent);
+router.get('/by-payment-intent/:pi_id', requireAuth, getOrderByPaymentIntent);
+
+// Customer Order History & Details
 router.get('/', requireAuth, getUserOrders);
 router.get('/:id', requireAuth, getOrderById);
 router.post('/:id/returns', requireAuth, submitReturnRequest);

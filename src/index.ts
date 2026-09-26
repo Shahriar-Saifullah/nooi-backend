@@ -18,6 +18,7 @@ import profileRoutes        from './routes/profile.routes';
 import sharedRoutes         from './routes/shared.routes';
 import notificationRoutes   from './routes/notifications.routes';
 import { errorHandler }     from './middleware/errorHandler';
+import { stripeWebhookHandler } from './controllers/orders.controller';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -27,11 +28,15 @@ const PORT = process.env.PORT || 3001;
 app.use(helmet());
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 1000 }));
 
-// Middleware
+// Middleware & CORS
 const allowedOrigins = process.env.FRONTEND_URL
   ? process.env.FRONTEND_URL.split(',').map(url => url.trim())
   : [];
 app.use(cors({ origin: allowedOrigins, credentials: true }));
+
+// Dedicated Stripe Webhook mounted BEFORE express.json() with raw body parser
+app.post('/orders/webhook', express.raw({ type: 'application/json' }), stripeWebhookHandler);
+
 app.use(express.json({ limit: '12mb' }));
 app.use(cookieParser());
 
@@ -57,8 +62,10 @@ app.use('/notifications',  notificationRoutes);
 // Error handler
 app.use(errorHandler);
 
-app.listen(PORT, () => {
-  console.log(`Nooi backend running on port ${PORT}`);
-});
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, () => {
+    console.log(`Nooi backend running on port ${PORT}`);
+  });
+}
 
 export default app;
