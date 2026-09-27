@@ -2,6 +2,7 @@ import { Router } from 'express';
 import {
   getProducts,
   getProductById,
+  getFacets,
   addProductReview,
   getCanvasProductLink,
   trackAffiliateClick,
@@ -17,5 +18,6 @@ router.get('/products/:id', getProductById);
 router.post('/products/:id/reviews', requireAuth, validate(addProductReviewSchema), addProductReview);
 router.get('/canvas-link/:canvasModelId', getCanvasProductLink);
 router.get('/affiliate/click', trackAffiliateClick);
+router.get('/facets', getFacets);
 
 export default router;
