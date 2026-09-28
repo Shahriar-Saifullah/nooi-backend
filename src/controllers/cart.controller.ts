@@ -1,5 +1,8 @@
 ﻿import { Request, Response } from 'express';
 import { supabase } from '../services/supabase';
+import { calculateShipping } from '../services/shipping.service';
+import { calculateTax } from '../services/tax.service';
+import { validatePromotion } from '../services/promotion.service';
 
 // Memory fallback store for sessions when DB table is empty/local dev
 const mockCartMemory: Record<string, any[]> = {};
@@ -101,6 +104,162 @@ export const addToCart = async (req: Request, res: Response) => {
     return res.status(500).json({ success: false, message: err.message });
   }
 };
+
+export const quoteCart = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user?.id ?? null;
+    const { promo_code } = req.body ?? {};
+ 
+    // Price from the database, never from the request. The client sends a code
+    // at most; every figure below is derived server-side.
+    const { data: rows, error } = await supabase
+      .from('cart_items')
+      .select(`
+        id, quantity, variant_id,
+        product_variants (
+          id, price, color, sku, images, stock_quantity, is_active,
+          products (
+            id, title, lead_time_days,
+            retailers ( id, name, logo_url, city, country, shipping_policy_json )
+          )
+        )
+      `)
+      .eq('user_id', userId);
+ 
+    if (error) {
+      console.error('[cart] quote query failed:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+ 
+    const items = rows ?? [];
+    if (items.length === 0) {
+      return res.json({
+        success: true,
+        groups: [], item_count: 0, subtotal: 0, shipping_total: 0,
+        tax_total: 0, discount_amount: 0, grand_total: 0, currency: 'USD',
+        promotion: null,
+      });
+    }
+ 
+    // Group by retailer — one shipment per vendor, which is what the cart shows
+    // and what order_shipments records.
+    const groups = new Map<string, any>();
+    let subtotal = 0;
+    let itemCount = 0;
+ 
+    for (const row of items) {
+      const variant: any = (row as any).product_variants;
+      const product: any = variant?.products;
+      const retailer: any = product?.retailers;
+      if (!variant || !product || !retailer) continue;
+ 
+      const unit = Number(variant.price);
+      const lineTotal = Number((unit * row.quantity).toFixed(2));
+      subtotal = Number((subtotal + lineTotal).toFixed(2));
+      itemCount += row.quantity;
+ 
+      if (!groups.has(retailer.id)) {
+        groups.set(retailer.id, {
+          retailer_id: retailer.id,
+          retailer_name: retailer.name,
+          logo_url: retailer.logo_url,
+          city: retailer.city,
+          country: retailer.country,
+          /** Slowest item in the group decides when the shipment lands. */
+          lead_time_days: 0,
+          items: [],
+          subtotal: 0,
+          _policy: retailer.shipping_policy_json,
+        });
+      }
+ 
+      const group = groups.get(retailer.id);
+      group.subtotal = Number((group.subtotal + lineTotal).toFixed(2));
+      group.lead_time_days = Math.max(group.lead_time_days, Number(product.lead_time_days ?? 14));
+      group.items.push({
+        cart_item_id: row.id,
+        variant_id: variant.id,
+        product_id: product.id,
+        title: product.title,
+        color: variant.color,
+        sku: variant.sku,
+        image: variant.images?.[0] ?? null,
+        unit_price: unit,
+        quantity: row.quantity,
+        line_total: lineTotal,
+        in_stock: variant.stock_quantity > 0 && variant.is_active,
+        stock_quantity: variant.stock_quantity,
+      });
+    }
+ 
+    // Promo applies to the subtotal before shipping and tax, so a code can
+    // never make delivery free as a side effect.
+    let discount = 0;
+    let promotion: any = null;
+    let promoError: string | null = null;
+ 
+    if (promo_code) {
+      const result = await validatePromotion(String(promo_code), subtotal, userId);
+      if (result.valid && result.promotion) {
+        discount = result.discount_amount;
+        promotion = {
+          code: result.promotion.code,
+          description: result.promotion.description,
+          discount_amount: discount,
+        };
+      } else {
+        promoError = result.message ?? 'That code could not be applied.';
+      }
+    }
+ 
+    let shippingTotal = 0;
+    let taxTotal = 0;
+    const out: any[] = [];
+ 
+    for (const group of groups.values()) {
+      const shipping = calculateShipping(
+        { id: group.retailer_id, name: group.retailer_name, shipping_policy_json: group._policy },
+        group.subtotal,
+      );
+      const tax = calculateTax(group.items, group.subtotal, shipping.shipping_amount);
+ 
+      shippingTotal = Number((shippingTotal + shipping.shipping_amount).toFixed(2));
+      taxTotal = Number((taxTotal + tax.tax_amount).toFixed(2));
+ 
+      const { _policy, ...clean } = group;
+      out.push({
+        ...clean,
+        shipping_amount: shipping.shipping_amount,
+        shipping_note: shipping.policy_applied,
+        estimated_delivery: shipping.estimated_delivery,
+        tax_amount: tax.tax_amount,
+      });
+    }
+ 
+    const grandTotal = Number(
+      Math.max(0, subtotal - discount + shippingTotal + taxTotal).toFixed(2),
+    );
+ 
+    return res.json({
+      success: true,
+      groups: out,
+      item_count: itemCount,
+      subtotal,
+      shipping_total: shippingTotal,
+      tax_total: taxTotal,
+      tax_provider: calculateTax([], 0, 0).provider,
+      discount_amount: discount,
+      promotion,
+      promo_error: promoError,
+      grand_total: grandTotal,
+      currency: 'USD',
+    });
+  } catch (err: any) {
+    console.error('[cart] quote threw:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+};
+
 
 export const updateCartItem = async (req: Request, res: Response) => {
   try {
