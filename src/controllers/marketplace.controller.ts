@@ -261,20 +261,41 @@ export const getProducts = async (req: Request, res: Response) => {
 export const getProductById = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-
+ 
     const { data, error } = await supabase
       .from('products')
-      .select('*, retailers(id, name, logo_url), product_variants(*), product_reviews(*)')
+      .select(
+        `id, retailer_id, canvas_model_id, type_id, title, description,
+         category, tags, base_price, affiliate_url, specs_json, lead_time_days,
+         created_at,
+         furniture_types(id, name, shop_group, group_sort),
+         retailers(id, name, logo_url, shipping_policy_json),
+         product_variants(*),
+         product_reviews(*)`,
+      )
       .eq('id', id)
-      .single();
-
-    if (error || !data) {
-      const mock = MOCK_PRODUCTS.find(p => p.id === id) || MOCK_PRODUCTS[0];
-      return res.json({ success: true, product: mock, is_mock: true });
+      .maybeSingle();
+ 
+    if (error) {
+      console.error('[marketplace] getProductById failed:', error);
+      return res.status(500).json({ success: false, error: error.message });
     }
-
-    return res.json({ success: true, product: data, is_mock: false });
+ 
+    if (!data) {
+      return res.status(404).json({ success: false, message: 'Product not found' });
+    }
+ 
+    return res.json({
+      success: true,
+      product: {
+        ...shapeForGrid(data),
+        // shapeForGrid is built for the grid and drops reviews. The detail page
+        // is the only surface that wants them.
+        product_reviews: (data as any).product_reviews ?? [],
+      },
+    });
   } catch (err: any) {
+    console.error('[marketplace] getProductById threw:', err);
     return res.status(500).json({ success: false, message: err.message });
   }
 };
