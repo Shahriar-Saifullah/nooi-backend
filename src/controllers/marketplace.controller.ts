@@ -319,25 +319,33 @@ export const addProductReview = async (req: Request, res: Response) => {
 export const getCanvasProductLink = async (req: Request, res: Response) => {
   try {
     const { canvasModelId } = req.params;
-
+ 
     const { data, error } = await supabase
       .from('products')
-      .select(`
-      id, retailer_id, canvas_model_id, type_id, title, description,
-      category, tags, base_price, affiliate_url, specs_json,
-      retailers(id, name, logo_url),
-      product_variants(*)
-      `)
+      .select(
+        `id, retailer_id, canvas_model_id, type_id, title, description,
+         category, tags, base_price, affiliate_url, specs_json, lead_time_days,
+         created_at,
+         furniture_types(id, name, shop_group, group_sort),
+         retailers(id, name, logo_url, shipping_policy_json),
+         product_variants(*)`,
+      )
       .eq('canvas_model_id', canvasModelId);
-
-    if (error) console.error('[canvas-link] query failed:', error);
-    if (error || !data || data.length === 0) {
-      const matching = MOCK_PRODUCTS.filter(p => p.canvas_model_id === canvasModelId || p.canvas_model_id.includes('sofa'));
-      return res.json({ success: true, products: matching.length ? matching : [MOCK_PRODUCTS[0]], is_mock: true });
+ 
+    if (error) {
+      console.error('[canvas-link] query failed:', error);
+      return res.status(500).json({ success: false, error: error.message });
     }
-
-    return res.json({ success: true, products: data });
+ 
+    // No match is an ordinary outcome — the catalogue has 43 models and no
+    // vendor carries all of them. The client falls back to a type-level match,
+    // which it can only do if we tell the truth here.
+    return res.json({
+      success: true,
+      products: (data ?? []).map(shapeForGrid),
+    });
   } catch (err: any) {
+    console.error('[canvas-link] threw:', err);
     return res.status(500).json({ success: false, message: err.message });
   }
 };
