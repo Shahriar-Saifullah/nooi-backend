@@ -4,6 +4,7 @@ import Stripe from 'stripe';
 import { supabase } from '../services/supabase';
 import { stripe } from '../services/stripe';
 import { calculateCheckout, CheckoutError } from '../services/checkout.service';
+import { consumePromotion } from '../services/promotion.service';
 import { createPaymentIntentSchema } from '../schemas/checkout.schema';
 import { AuthRequest } from '../types';
 
@@ -25,8 +26,17 @@ export const createPaymentIntent = async (req: Request, res: Response) => {
 
     const { shipping_address } = parseResult.data;
 
+    // Read the promo code off the raw body rather than the parsed result: zod
+    // strips unknown keys, and adding it to createPaymentIntentSchema would
+    // touch a file the checkout tests assert against. Length-bounded because it
+    // goes into a database lookup; validatePromotion does the rest.
+    const promoCode =
+      typeof (req.body as any)?.promo_code === 'string'
+        ? (req.body as any).promo_code.trim().slice(0, 64) || null
+        : null;
+
     // 1. Calculate snapshot from live server-side database cart
-    const summary = await calculateCheckout(userId, shipping_address);
+    const summary = await calculateCheckout(userId, shipping_address, undefined, promoCode);
 
     // 2. Check if an active attempt exists for this user and matching cart snapshot hash
     const { data: existingAttempt } = await supabase
@@ -116,6 +126,7 @@ export const createPaymentIntent = async (req: Request, res: Response) => {
           checkout_attempt_id: attemptId,
           user_id: userId,
           cart_snapshot_hash: summary.cart_snapshot_hash,
+          promotion_code: summary.promotion_code ?? '',
         },
         automatic_payment_methods: { enabled: true },
       },
@@ -408,6 +419,53 @@ async function handlePaymentIntentSucceeded(pi: any) {
 
     // For other unexpected database errors, throw so webhook fails and Stripe retries
     throw rpcError;
+  }
+
+  // 4b. Record the discount on the order, and consume the code.
+  //
+  // Both happen AFTER payment succeeds. Counting a code as used at quote time
+  // would burn a shopper's single allowed use on an order that never completed.
+  //
+  // create_order_atomic writes total_amount from p_grand_total, which is already
+  // net of the discount. Without these columns, subtotal + shipping + tax would
+  // not reconcile to the total on any invoice or refund calculation.
+  if (Number(snapshot.discount_amount) > 0) {
+    const { error: discountErr } = await supabase
+      .from('orders')
+      .update({
+        discount_amount: snapshot.discount_amount,
+        promotion_code: snapshot.promotion_code,
+        promotion_id: snapshot.promotion_id,
+      })
+      .eq('id', orderId);
+
+    if (discountErr) {
+      // The order is real and paid — a missing discount annotation is a
+      // reporting gap, not a reason to fail the webhook and have Stripe retry.
+      console.error('[checkout] could not record discount on order', {
+        order_id: orderId,
+        error: discountErr.message,
+      });
+    }
+
+    if (snapshot.promotion_id) {
+      const consumed = await consumePromotion(
+        snapshot.promotion_id,
+        attempt.user_id,
+        orderId as unknown as string,
+        Number(snapshot.discount_amount),
+      );
+
+      if (!consumed) {
+        // The code hit its limit between the quote and this capture. The order
+        // stands at the amount already authorised — we do not re-charge the
+        // difference — but it is worth knowing it happened.
+        console.warn('[checkout] promotion could not be consumed', {
+          order_id: orderId,
+          promotion_id: snapshot.promotion_id,
+        });
+      }
+    }
   }
 
   // 5. Mark attempt completed

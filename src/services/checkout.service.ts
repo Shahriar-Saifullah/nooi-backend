@@ -2,6 +2,7 @@
 import { supabase } from './supabase';
 import { calculateShipping, ShippingCalculationResult } from './shipping.service';
 import { calculateTax, TaxCalculationResult } from './tax.service';
+import { validatePromotion } from './promotion.service';
 import { ShippingAddressInput } from '../schemas/checkout.schema';
 
 export interface CheckoutItemSnapshot {
@@ -33,6 +34,10 @@ export interface CheckoutSummary {
   subtotal: number;
   shipping_total: number;
   tax_total: number;
+  /** Taken off the goods subtotal only, never off shipping or tax. */
+  discount_amount: number;
+  promotion_id: string | null;
+  promotion_code: string | null;
   grand_total: number;
   grand_total_cents: number;
   currency: string;
@@ -51,7 +56,13 @@ export class CheckoutError extends Error {
 export async function calculateCheckout(
   userId: string,
   shippingAddress: ShippingAddressInput,
-  currency = process.env.CHECKOUT_CURRENCY || 'USD'
+  currency = process.env.CHECKOUT_CURRENCY || 'USD',
+  /**
+   * The promo CODE, never a discount amount. The amount is derived below from a
+   * subtotal this function calculated itself — if the client could send a
+   * figure, it could send any figure.
+   */
+  promoCode?: string | null
 ): Promise<CheckoutSummary> {
   const { data: cartItems, error } = await supabase
     .from('cart_items')
@@ -150,11 +161,36 @@ export async function calculateCheckout(
     });
   }
 
-  const grand_total = Number((subtotal + shipping_total + tax_total).toFixed(2));
+  // Promotion — same validator the cart quote uses, so the figure a shopper was
+  // shown and the figure they are charged come from one place.
+  let discount_amount = 0;
+  let promotion_id: string | null = null;
+  let promotion_code: string | null = null;
+
+  if (promoCode) {
+    const promo = await validatePromotion(promoCode, subtotal, userId);
+    if (promo.valid && promo.promotion) {
+      discount_amount = promo.discount_amount;
+      promotion_id = promo.promotion.id;
+      promotion_code = promo.promotion.code;
+    }
+    // An invalid code here is not an error. It may have expired between the
+    // cart and the payment sheet; charging full price is the correct outcome,
+    // and the cart already told them whether it applied.
+  }
+
+  const grand_total = Number(
+    Math.max(0, subtotal - discount_amount + shipping_total + tax_total).toFixed(2)
+  );
   const grand_total_cents = Math.round(grand_total * 100);
 
   // Deterministic Cart Snapshot Hash:
-  // sha256(userId + sorted(variant_id:quantity:unit_price))
+  // sha256(userId + sorted(variant_id:quantity:unit_price) + promo)
+  //
+  // The promo is part of the hash because this value dedupes PaymentIntents.
+  // Without it, applying a code to an otherwise unchanged cart would reuse the
+  // intent created before the discount — and charge the undiscounted amount
+  // through the deduplication path rather than the pricing one.
   const sortedItemsKey = flatItems
     .slice()
     .sort((a, b) => a.variant_id.localeCompare(b.variant_id))
@@ -163,7 +199,7 @@ export async function calculateCheckout(
 
   const cart_snapshot_hash = crypto
     .createHash('sha256')
-    .update(`${userId}:${sortedItemsKey}`)
+    .update(`${userId}:${sortedItemsKey}:${promotion_code ?? ''}:${discount_amount}`)
     .digest('hex');
 
   return {
@@ -174,6 +210,9 @@ export async function calculateCheckout(
     subtotal,
     shipping_total,
     tax_total,
+    discount_amount,
+    promotion_id,
+    promotion_code,
     grand_total,
     grand_total_cents,
     currency,
