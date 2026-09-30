@@ -504,7 +504,20 @@ export const getOrderByPaymentIntent = async (req: Request, res: Response) => {
     // First check if order already exists in orders table
     const { data: order } = await supabase
       .from('orders')
-      .select('*, order_items(*), order_shipments(*)')
+      .select(`
+        *,
+        order_items (
+          *,
+          product_variants (
+            id, sku, color, material, images,
+            products ( id, title, canvas_model_id )
+          )
+        ),
+        order_shipments (
+          *,
+          retailers ( id, name, logo_url, city, country )
+        )
+      `)
       .eq('payment_intent_id', pi_id)
       .maybeSingle();
 
@@ -565,7 +578,20 @@ export const getUserOrders = async (req: Request, res: Response) => {
 
     const { data, error } = await supabase
       .from('orders')
-      .select('*, order_items(*), order_shipments(*)')
+      .select(`
+        *,
+        order_items (
+          *,
+          product_variants (
+            id, sku, color, images,
+            products ( id, title )
+          )
+        ),
+        order_shipments (
+          *,
+          retailers ( id, name, logo_url, city, country )
+        )
+      `)
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
 
@@ -588,7 +614,21 @@ export const getOrderById = async (req: Request, res: Response) => {
 
     const { data, error } = await supabase
       .from('orders')
-      .select('*, order_items(*), order_shipments(*, order_tracking_events(*))')
+      .select(`
+        *,
+        order_items (
+          *,
+          product_variants (
+            id, sku, color, material, images,
+            products ( id, title, canvas_model_id )
+          )
+        ),
+        order_shipments (
+          *,
+          retailers ( id, name, logo_url, city, country ),
+          order_tracking_events ( * )
+        )
+      `)
       .eq('id', id)
       .maybeSingle();
 
