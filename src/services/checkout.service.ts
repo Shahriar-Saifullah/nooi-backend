@@ -82,6 +82,8 @@ export async function calculateCheckout(
     retailer: any;
     items: CheckoutItemSnapshot[];
     subtotal: number;
+    /** A shipment is only as fast as its slowest piece. */
+    lead_time_days: number;
   }>();
 
   for (const item of cartItems) {
@@ -128,13 +130,18 @@ export async function calculateCheckout(
       retailerMap.set(retailer.id, {
         retailer,
         items: [],
-        subtotal: 0
+        subtotal: 0,
+        lead_time_days: 0,
       });
     }
 
     const group = retailerMap.get(retailer.id)!;
     group.items.push(snapshotItem);
     group.subtotal = Number((group.subtotal + total_price).toFixed(2));
+    group.lead_time_days = Math.max(
+      group.lead_time_days,
+      Number(product.lead_time_days ?? 0)
+    );
   }
 
   let subtotal = 0;
@@ -144,7 +151,12 @@ export async function calculateCheckout(
   const retailerGroups: RetailerGroupSnapshot[] = [];
 
   for (const [, group] of retailerMap.entries()) {
-    const shipping = calculateShipping(group.retailer, group.subtotal, currency);
+    const shipping = calculateShipping(
+      group.retailer,
+      group.subtotal,
+      currency,
+      group.lead_time_days || null,
+    );
     const tax = calculateTax(group.items, group.subtotal, shipping.shipping_amount);
 
     subtotal = Number((subtotal + group.subtotal).toFixed(2));
