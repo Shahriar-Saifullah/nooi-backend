@@ -220,6 +220,8 @@ export const quoteCart = async (req: Request, res: Response) => {
       const shipping = calculateShipping(
         { id: group.retailer_id, name: group.retailer_name, shipping_policy_json: group._policy },
         group.subtotal,
+        'USD',
+        group.lead_time_days || null,
       );
       const tax = calculateTax(group.items, group.subtotal, shipping.shipping_amount);
  
