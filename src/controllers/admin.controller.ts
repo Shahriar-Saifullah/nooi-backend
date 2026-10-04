@@ -724,3 +724,170 @@ export async function decideVendorApplication(req: AuthRequest, res: Response) {
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }
+
+/**
+ * Admin overview — add to src/controllers/admin.controller.ts
+ * ============================================================================
+ * Route:  router.get('/overview', requireAdmin, getAdminOverview);
+ *
+ * getAdminStats answers "how are we doing" — total users, total projects. The
+ * dashboard asks a different question: what is waiting on me, and what has been
+ * waiting longest. Those need per-queue pending counts and the age of the
+ * oldest item, which is a different query entirely.
+ *
+ * Queues with no backend yet report `available: false` rather than zero. A zero
+ * means "nothing waiting", which is a claim this code cannot make about
+ * listings or cancellations — there is no table to look in. Showing an honest
+ * "not built" beats an encouraging lie on a screen whose whole job is telling
+ * an admin what they have missed.
+ */
+
+interface QueueSummary {
+  key: string;
+  label: string;
+  href: string;
+  count: number;
+  /** ISO timestamp of the oldest waiting item, for the age label. */
+  oldest: string | null;
+  available: boolean;
+}
+
+export async function getAdminOverview(req: AuthRequest, res: Response) {
+  try {
+    const queues: QueueSummary[] = [];
+    const oldestItems: any[] = [];
+
+    // ── Vendor applications ──────────────────────────────────────────────
+    const { data: pendingVendors } = await supabase
+      .from('vendor_profiles')
+      .select('id, business_name, submitted_at')
+      .eq('status', 'pending')
+      .order('submitted_at', { ascending: true, nullsFirst: false });
+
+    const vendorRows = pendingVendors || [];
+    queues.push({
+      key: 'vendors',
+      label: 'Vendor applications',
+      href: '/admin/applications',
+      count: vendorRows.length,
+      oldest: vendorRows[0]?.submitted_at || null,
+      available: true,
+    });
+
+    for (const v of vendorRows.slice(0, 5)) {
+      oldestItems.push({
+        queue: 'Vendor application',
+        title: v.business_name,
+        ref: v.id,
+        href: `/admin/applications?id=${v.id}`,
+        since: v.submitted_at,
+      });
+    }
+
+    // ── Return requests ──────────────────────────────────────────────────
+    // order_returns exists and the shopper-side flow writes to it, so this is
+    // real even though the refunds screen isn't built. An admin should see the
+    // backlog before the screen to clear it exists, not after.
+    const { data: pendingReturns, error: returnsError } = await supabase
+      .from('order_returns')
+      .select('id, order_id, reason, created_at')
+      .eq('status', 'requested')
+      .order('created_at', { ascending: true });
+
+    if (!returnsError) {
+      const returnRows = pendingReturns || [];
+      queues.push({
+        key: 'refunds',
+        label: 'Return requests',
+        href: '/admin/refunds',
+        count: returnRows.length,
+        oldest: returnRows[0]?.created_at || null,
+        available: true,
+      });
+
+      for (const r of returnRows.slice(0, 5)) {
+        oldestItems.push({
+          queue: 'Return request',
+          title: r.reason?.slice(0, 60) || 'Return request',
+          ref: r.order_id,
+          href: `/admin/refunds?id=${r.id}`,
+          since: r.created_at,
+        });
+      }
+    }
+
+    // ── Not built yet ────────────────────────────────────────────────────
+    // Declared so the dashboard can show the shape of the job, with
+    // available:false so it never claims a count it cannot know.
+    queues.push(
+      { key: 'listings', label: 'Listing approvals', href: '/admin/listings', count: 0, oldest: null, available: false },
+      { key: 'cancellations', label: 'Cancellations', href: '/admin/cancellations', count: 0, oldest: null, available: false },
+      { key: 'support', label: 'Support', href: '/admin/support', count: 0, oldest: null, available: false },
+    );
+
+    // Oldest first across every queue — the point of the panel is that the
+    // thing waiting longest is rarely in the queue you happen to open.
+    oldestItems.sort((a, b) => {
+      const ta = a.since ? new Date(a.since).getTime() : Infinity;
+      const tb = b.since ? new Date(b.since).getTime() : Infinity;
+      return ta - tb;
+    });
+
+    // ── Recent interventions ─────────────────────────────────────────────
+    const { data: recent } = await supabase
+      .from('admin_audit_log')
+      .select('id, action, entity_type, entity_id, summary, actor_email, created_at')
+      .order('created_at', { ascending: false })
+      .limit(6);
+
+    // Name the actors in one query rather than one per row.
+    const actorEmails = [...new Set((recent || []).map((r: any) => r.actor_email).filter(Boolean))];
+    let namesByEmail = new Map<string, string>();
+    if (actorEmails.length > 0) {
+      const { data: users } = await supabase.auth.admin.listUsers();
+      const matching = (users?.users || []).filter((u: any) => actorEmails.includes(u.email));
+      namesByEmail = new Map(
+        matching.map((u: any) => [u.email, u.user_metadata?.full_name || u.email])
+      );
+    }
+
+    const interventions = (recent || []).map((r: any) => ({
+      ...r,
+      actor_name: r.actor_email ? namesByEmail.get(r.actor_email) || r.actor_email : 'System',
+    }));
+
+    // ── Secondary figures ────────────────────────────────────────────────
+    const [usersCount, vendorsCount, approvedVendors, ordersCount] = await Promise.all([
+      supabase.from('profiles').select('id', { count: 'exact', head: true }),
+      supabase.from('vendor_profiles').select('id', { count: 'exact', head: true }),
+      supabase.from('vendor_profiles').select('id', { count: 'exact', head: true }).eq('status', 'approved'),
+      supabase.from('orders').select('id', { count: 'exact', head: true }),
+    ]);
+
+    const totalWaiting = queues
+      .filter(q => q.available)
+      .reduce((n, q) => n + q.count, 0);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        queues,
+        total_waiting: totalWaiting,
+        oldest: oldestItems.slice(0, 5),
+        interventions,
+        kpis: {
+          total_users: usersCount.count || 0,
+          total_vendors: vendorsCount.count || 0,
+          approved_vendors: approvedVendors.count || 0,
+          total_orders: ordersCount.count || 0,
+        },
+        // So the client can say how fresh the figures are rather than implying
+        // they're live.
+        generated_at: new Date().toISOString(),
+      },
+    });
+  } catch (err) {
+    console.error('getAdminOverview error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
