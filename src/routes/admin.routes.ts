@@ -7,6 +7,10 @@ import {
   updateUserRole,
   createAdminUser,
   getAdminStats,
+  getVendorQueue,
+  getVendorForReview,
+  claimVendorReview,
+  decideVendorApplication,
 } from '../controllers/admin.controller';
 import { requireAdmin } from '../middleware/auth.middleware';
 import { validate } from '../middleware/validate';
@@ -22,8 +26,17 @@ const router = Router();
 router.get('/stats', requireAdmin, getAdminStats);
 
 // Vendor Management
+//
+// `/vendors/queue` is declared BEFORE `/vendors/:id`. Express matches in
+// declaration order, so with the parameter route first it would read "queue" as
+// an id, look for a vendor with that primary key, and 404 — the queue endpoint
+// would never be reached.
+router.get('/vendors/queue', requireAdmin, getVendorQueue);
 router.get('/vendors', requireAdmin, listVendors);
 router.get('/vendors/:id', requireAdmin, getVendorById);
+router.get('/vendors/:id/review', requireAdmin, getVendorForReview);
+router.post('/vendors/:id/review/claim', requireAdmin, claimVendorReview);
+router.post('/vendors/:id/decision', requireAdmin, decideVendorApplication);
 router.patch('/vendors/:id/status', requireAdmin, validate(updateVendorStatusSchema), updateVendorStatus);
 
 // User & Role Management
