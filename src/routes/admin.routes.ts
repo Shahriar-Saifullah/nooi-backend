@@ -10,6 +10,7 @@ import {
   getVendorQueue,
   getVendorForReview,
   claimVendorReview,
+  getAdminOverview,
   decideVendorApplication,
 } from '../controllers/admin.controller';
 import { requireAdmin } from '../middleware/auth.middleware';
@@ -45,5 +46,6 @@ router.patch('/users/:id/role', requireAdmin, validate(updateUserRoleSchema), up
 
 // Create new administrator
 router.post('/create-admin', requireAdmin, validate(createAdminSchema), createAdminUser);
+router.get('/overview', requireAdmin, getAdminOverview);
 
 export default router;
