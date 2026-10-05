@@ -10,7 +10,10 @@ import {
   getVendorQueue,
   getVendorForReview,
   claimVendorReview,
+  getTeam,
+  inviteTeamMember,
   getAdminOverview,
+  getVendorDocumentUrl,
   decideVendorApplication,
 } from '../controllers/admin.controller';
 import { requireAdmin } from '../middleware/auth.middleware';
@@ -34,6 +37,7 @@ router.get('/stats', requireAdmin, getAdminStats);
 // would never be reached.
 router.get('/vendors/queue', requireAdmin, getVendorQueue);
 router.get('/vendors', requireAdmin, listVendors);
+router.get('/vendors/:id/documents/:kind', requireAdmin, getVendorDocumentUrl);
 router.get('/vendors/:id', requireAdmin, getVendorById);
 router.get('/vendors/:id/review', requireAdmin, getVendorForReview);
 router.post('/vendors/:id/review/claim', requireAdmin, claimVendorReview);
@@ -47,5 +51,8 @@ router.patch('/users/:id/role', requireAdmin, validate(updateUserRoleSchema), up
 // Create new administrator
 router.post('/create-admin', requireAdmin, validate(createAdminSchema), createAdminUser);
 router.get('/overview', requireAdmin, getAdminOverview);
+
+router.get('/team',         requireAdmin, getTeam);
+router.post('/team/invite', requireAdmin, inviteTeamMember);
 
 export default router;

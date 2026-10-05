@@ -891,3 +891,254 @@ export async function getAdminOverview(req: AuthRequest, res: Response) {
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }
+
+/**
+ * Team — add to src/controllers/admin.controller.ts
+ * ============================================================================
+ * Routes:
+ *   router.get('/team',          requireAdmin, getTeam);
+ *   router.post('/team/invite',  requireAdmin, inviteTeamMember);
+ *
+ * listUsers already exists but is the wrong shape here: it selects from
+ * profiles, which has no email and no sign-in history. The team screen needs
+ * both — "who is this" and "are they still using it" — and those live in
+ * auth.users.
+ */
+
+/** Console roles, least to most privileged. Order matters for the matrix. */
+const CONSOLE_ROLES = ['admin', 'super_admin'] as const;
+
+export async function getTeam(req: AuthRequest, res: Response) {
+  try {
+    const { data: profiles, error } = await supabase
+      .from('profiles')
+      .select('id, full_name, role, avatar_url, created_at')
+      .in('role', CONSOLE_ROLES as unknown as string[])
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+
+    // Email and last sign-in live in auth.users, not profiles. One listUsers
+    // call and a map, rather than a getUserById per row.
+    const { data: authData } = await supabase.auth.admin.listUsers({ perPage: 200 });
+    const authById = new Map(
+      (authData?.users || []).map((u: any) => [u.id, u])
+    );
+
+    const members = (profiles || []).map(p => {
+      const au: any = authById.get(p.id);
+      return {
+        id: p.id,
+        full_name: p.full_name,
+        email: au?.email || null,
+        role: p.role,
+        avatar_url: p.avatar_url,
+        created_at: p.created_at,
+        last_sign_in_at: au?.last_sign_in_at || null,
+        /**
+         * An invited member who has never signed in is in a different state
+         * from an active one — the invite may have gone to a dead mailbox, and
+         * an admin account nobody has ever used is worth noticing.
+         */
+        status: au?.last_sign_in_at
+          ? 'active'
+          : au?.invited_at
+            ? 'invited'
+            : 'never signed in',
+      };
+    });
+
+    /**
+     * The permission matrix, derived from the guards that actually run rather
+     * than written by hand. Every entry below corresponds to a real check in
+     * this codebase — if someone changes requireAdmin or the super_admin guards
+     * in updateUserRole, this table has to change with them or it becomes a
+     * description of what we wish were true.
+     */
+    const permissions = [
+      { label: 'Open the console',            admin: true,  super_admin: true,
+        note: 'requireAdmin on every /admin route' },
+      { label: 'Approve or reject vendors',   admin: true,  super_admin: true,
+        note: 'decideVendorApplication' },
+      { label: 'Change a user\'s role',       admin: true,  super_admin: true,
+        note: 'updateUserRole' },
+      { label: 'Modify a super admin',        admin: false, super_admin: true,
+        note: 'target role check in updateUserRole' },
+      { label: 'Assign the super admin role', admin: false, super_admin: true,
+        note: 'assigned role check in updateUserRole' },
+      { label: 'Create an admin account',     admin: true,  super_admin: true,
+        note: 'createAdminUser' },
+      { label: 'Create a super admin',        admin: false, super_admin: true,
+        note: 'requester check in createAdminUser' },
+    ];
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        members,
+        permissions,
+        roles: CONSOLE_ROLES,
+        viewer_role: req.userProfile?.role || 'admin',
+      },
+    });
+  } catch (err) {
+    console.error('getTeam error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+/**
+ * Invite someone to the console.
+ *
+ * Deliberately an invite rather than createAdminUser: that one takes a password
+ * chosen by the inviter, which means an admin credential travels through
+ * whatever channel they use to pass it on. inviteUserByEmail sends a one-time
+ * link and the invitee sets their own password, so nobody else ever knows it.
+ */
+export async function inviteTeamMember(req: AuthRequest, res: Response) {
+  try {
+    const { email, role } = req.body || {};
+    const requesterRole = req.userProfile?.role;
+
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ success: false, error: 'An email address is required' });
+    }
+    if (!CONSOLE_ROLES.includes(role)) {
+      return res.status(400).json({ success: false, error: 'Role must be admin or super_admin' });
+    }
+    if (role === 'super_admin' && requesterRole !== 'super_admin') {
+      return res.status(403).json({
+        success: false,
+        error: 'Only super administrators can invite a super_admin',
+      });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+
+    const { data, error } = await supabase.auth.admin.inviteUserByEmail(cleanEmail, {
+      data: { role },
+      redirectTo: `${process.env.FRONTEND_URL?.split(',')[0] || ''}/authpage/signin`,
+    });
+
+    if (error) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+
+    const invitedId = data?.user?.id;
+    if (invitedId) {
+      // profiles.role is what RBAC reads. The invite's user_metadata is not
+      // enough — a user can rewrite their own metadata, and requireRole does
+      // not look there.
+      await supabase.from('profiles').upsert(
+        { id: invitedId, role, updated_at: new Date().toISOString() },
+        { onConflict: 'id' },
+      );
+    }
+
+    await supabase.from('admin_audit_log').insert({
+      actor_id: req.user?.id || null,
+      actor_email: req.user?.email || null,
+      action: 'team.invited',
+      entity_type: 'profile',
+      entity_id: invitedId || null,
+      summary: `Invited ${cleanEmail} as ${role}`,
+      metadata: { email: cleanEmail, role },
+    });
+
+    return res.status(201).json({
+      success: true,
+      data: { email: cleanEmail, role, id: invitedId || null },
+      message: `Invite sent to ${cleanEmail}`,
+    });
+  } catch (err) {
+    console.error('inviteTeamMember error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+const DOCUMENT_BUCKET = 'vendor-documents';
+const SIGNED_URL_TTL_SECONDS = 300;
+ 
+export async function getVendorDocumentUrl(req: AuthRequest, res: Response) {
+  try {
+    const vendorId = req.params.id as string;
+    const kind = req.params.kind as string;
+ 
+    const { data: vendor, error } = await supabase
+      .from('vendor_profiles')
+      .select('id, business_name, legal_documents')
+      .eq('id', vendorId)
+      .maybeSingle();
+ 
+    if (error) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+    if (!vendor) {
+      return res.status(404).json({ success: false, error: 'Vendor not found' });
+    }
+ 
+    // The path comes from the vendor's own record, never from the request. A
+    // caller supplying its own path could sign a URL for any object in the
+    // bucket, including another vendor's bank letter.
+    const docs: any[] = Array.isArray(vendor.legal_documents) ? vendor.legal_documents : [];
+    const doc = docs.find(d => d?.kind === kind);
+ 
+    if (!doc?.path) {
+      return res.status(404).json({
+        success: false,
+        error: 'That document has not been provided',
+      });
+    }
+ 
+    // Storage keys are stored with the bucket name prefixed in some rows and
+    // not others. Normalise rather than letting one shape 404.
+    const objectPath = String(doc.path).replace(new RegExp(`^${DOCUMENT_BUCKET}/`), '');
+ 
+    const { data: signed, error: signError } = await supabase.storage
+      .from(DOCUMENT_BUCKET)
+      .createSignedUrl(objectPath, SIGNED_URL_TTL_SECONDS);
+ 
+    if (signError || !signed?.signedUrl) {
+      // The record exists but the file does not — most likely a vendor row
+      // created before uploads were wired up. Say which, because "document
+      // missing" and "storage misconfigured" need different fixes.
+      console.error('[admin] could not sign document', {
+        vendor_id: vendorId,
+        kind,
+        path: objectPath,
+        error: signError?.message,
+      });
+      return res.status(404).json({
+        success: false,
+        error: 'The file is recorded but not in storage. It may never have been uploaded.',
+      });
+    }
+ 
+    // Viewing a vendor's legal documents is worth recording. If a registration
+    // turns out to be fraudulent, who looked at the licence and when is the
+    // first question asked.
+    await supabase.from('admin_audit_log').insert({
+      actor_id: req.user?.id || null,
+      actor_email: req.user?.email || null,
+      action: 'vendor.document_viewed',
+      entity_type: 'vendor_profile',
+      entity_id: vendorId,
+      summary: `Viewed ${doc.label || kind} for ${vendor.business_name}`,
+      metadata: { kind, label: doc.label || null },
+    });
+ 
+    return res.status(200).json({
+      success: true,
+      data: {
+        url: signed.signedUrl,
+        label: doc.label || kind,
+        expires_in: SIGNED_URL_TTL_SECONDS,
+      },
+    });
+  } catch (err) {
+    console.error('getVendorDocumentUrl error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
