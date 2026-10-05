@@ -25,7 +25,13 @@
  *
  * Usage:
  *   npx ts-node scripts/seed-vendor-applications.ts
+ *   npx ts-node scripts/seed-vendor-applications.ts --upload-docs
  *   npx ts-node scripts/seed-vendor-applications.ts --clean
+ *
+ * --upload-docs puts a placeholder PDF at every recorded document path, so the
+ * admin screen's View button has something to open. Without it the records
+ * exist and the files do not, which is a real state (a vendor row created
+ * before uploads were wired up) but not a useful one to develop against.
  *
  * Every account uses the .test TLD, which is reserved and undeliverable by
  * design — these can never accidentally email a real person, and --clean finds
@@ -347,10 +353,74 @@ async function seed() {
   console.log('should warn about the duplicate rather than block it.');
 }
 
+/**
+ * A minimal valid PDF. Hand-written rather than pulled from a fixture file so
+ * the script stays self-contained — it only has to open in a viewer, not look
+ * like anything.
+ */
+function placeholderPdf(title: string): Buffer {
+  const text = `BT /F1 16 Tf 60 720 Td (${title.replace(/[()\\]/g, '')}) Tj ET`;
+  const objs = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
+    `<< /Length ${text.length} >>\nstream\n${text}\nendstream`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+  ];
+  let pdf = '%PDF-1.4\n';
+  const offsets: number[] = [];
+  objs.forEach((o, i) => {
+    offsets.push(pdf.length);
+    pdf += `${i + 1} 0 obj\n${o}\nendobj\n`;
+  });
+  const xref = pdf.length;
+  pdf += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n`;
+  for (const off of offsets) pdf += `${String(off).padStart(10, '0')} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return Buffer.from(pdf, 'latin1');
+}
+
+async function uploadDocs() {
+  const { data: vendors, error } = await supabase
+    .from('vendor_profiles')
+    .select('id, business_name, legal_documents');
+
+  if (error) throw error;
+
+  let uploaded = 0;
+  for (const v of vendors || []) {
+    const docs: any[] = Array.isArray(v.legal_documents) ? v.legal_documents : [];
+    for (const d of docs) {
+      if (!d?.path) continue;
+      const objectPath = String(d.path).replace(/^vendor-documents\//, '');
+      const { error: upErr } = await supabase.storage
+        .from('vendor-documents')
+        .upload(objectPath, placeholderPdf(`${d.label} — ${v.business_name}`), {
+          contentType: 'application/pdf',
+          upsert: true,
+        });
+      if (upErr) {
+        console.error(`  ${v.business_name} / ${d.kind}: ${upErr.message}`);
+      } else {
+        uploaded += 1;
+      }
+    }
+  }
+  console.log(`Uploaded ${uploaded} placeholder document(s).`);
+  if (uploaded === 0) {
+    console.log('If every upload failed, check the vendor-documents bucket exists and is private.');
+  }
+}
+
 (async () => {
-  const mode = process.argv.includes('--clean') ? 'clean' : 'seed';
+  const mode = process.argv.includes('--clean')
+    ? 'clean'
+    : process.argv.includes('--upload-docs')
+      ? 'upload'
+      : 'seed';
   try {
     if (mode === 'clean') await clean();
+    else if (mode === 'upload') await uploadDocs();
     else await seed();
   } catch (err: any) {
     console.error('\nFailed:', err.message ?? err);
