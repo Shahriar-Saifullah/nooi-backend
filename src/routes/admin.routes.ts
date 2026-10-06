@@ -14,6 +14,8 @@ import {
   inviteTeamMember,
   getAdminOverview,
   getVendorDocumentUrl,
+  getAuditLog,
+  exportAuditLog,
   decideVendorApplication,
 } from '../controllers/admin.controller';
 import { requireAdmin } from '../middleware/auth.middleware';
@@ -54,5 +56,7 @@ router.get('/overview', requireAdmin, getAdminOverview);
 
 router.get('/team',         requireAdmin, getTeam);
 router.post('/team/invite', requireAdmin, inviteTeamMember);
+router.get('/audit',        requireAdmin, getAuditLog);
+router.get('/audit/export', requireAdmin, exportAuditLog);
 
 export default router;

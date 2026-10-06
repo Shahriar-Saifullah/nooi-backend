@@ -1142,3 +1142,153 @@ export async function getVendorDocumentUrl(req: AuthRequest, res: Response) {
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }
+
+/**
+ * Audit log — add to src/controllers/admin.controller.ts
+ * ============================================================================
+ * Routes:
+ *   router.get('/audit',            requireAdmin, getAuditLog);
+ *   router.get('/audit/export',     requireAdmin, exportAuditLog);
+ *
+ * Read-only by design. admin_audit_log has no update or delete path anywhere in
+ * this codebase, and no RLS policy that would let a browser write to it — an
+ * audit log an admin can edit is not an audit log.
+ *
+ * The filter options come from the data rather than a hardcoded list. An action
+ * type that exists in the table but not in the dropdown is invisible, which is
+ * the one failure an audit log must not have.
+ */
+
+export async function getAuditLog(req: AuthRequest, res: Response) {
+  try {
+    const search = req.query.search as string | undefined;
+    const actor = req.query.actor as string | undefined;
+    const action = req.query.action as string | undefined;
+    const page = Math.max(1, parseInt((req.query.page as string) || '1', 10));
+    const limit = Math.max(1, Math.min(200, parseInt((req.query.limit as string) || '50', 10)));
+    const offset = (page - 1) * limit;
+
+    let query = supabase
+      .from('admin_audit_log')
+      .select('*', { count: 'exact' });
+
+    if (actor && actor !== 'all') {
+      query = query.eq('actor_email', actor);
+    }
+    if (action && action !== 'all') {
+      // Prefix match so "vendor" catches vendor.approved, vendor.rejected and
+      // vendor.document_viewed — an admin thinks in subjects, not event names.
+      query = query.like('action', `${action}%`);
+    }
+    if (search) {
+      query = query.or(
+        `summary.ilike.%${search}%,entity_id.ilike.%${search}%,action.ilike.%${search}%`
+      );
+    }
+
+    query = query
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    const { data, error, count } = await query;
+
+    if (error) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+
+    // Filter options from the data itself. A hardcoded list goes stale the
+    // first time someone adds an action type, and an entry you cannot filter
+    // to is an entry nobody finds.
+    const { data: allRows } = await supabase
+      .from('admin_audit_log')
+      .select('actor_email, action');
+
+    const actors = [...new Set((allRows || []).map((r: any) => r.actor_email).filter(Boolean))].sort();
+    const actionGroups = [...new Set(
+      (allRows || []).map((r: any) => String(r.action).split('.')[0]).filter(Boolean)
+    )].sort();
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        entries: data || [],
+        actors,
+        action_groups: actionGroups,
+        pagination: {
+          total: count || 0,
+          page,
+          limit,
+          totalPages: Math.ceil((count || 0) / limit),
+        },
+      },
+    });
+  } catch (err) {
+    console.error('getAuditLog error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+/**
+ * CSV export.
+ *
+ * Exports every row matching the filters, not just the current page — an export
+ * that silently stops at 50 rows is worse than none, because the person reading
+ * it believes they have the whole picture.
+ */
+export async function exportAuditLog(req: AuthRequest, res: Response) {
+  try {
+    const search = req.query.search as string | undefined;
+    const actor = req.query.actor as string | undefined;
+    const action = req.query.action as string | undefined;
+
+    let query = supabase.from('admin_audit_log').select('*');
+
+    if (actor && actor !== 'all') query = query.eq('actor_email', actor);
+    if (action && action !== 'all') query = query.like('action', `${action}%`);
+    if (search) {
+      query = query.or(
+        `summary.ilike.%${search}%,entity_id.ilike.%${search}%,action.ilike.%${search}%`
+      );
+    }
+
+    const { data, error } = await query.order('created_at', { ascending: false }).limit(10000);
+
+    if (error) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+
+    const header = ['Time (UTC)', 'Admin', 'Action', 'Record type', 'Record', 'Summary'];
+
+    /**
+     * A field starting with = + - or @ is executed as a formula when the file
+     * opens in Excel or Sheets. Admin-entered text ends up in this export, so
+     * prefix those with an apostrophe.
+     */
+    const cell = (v: unknown): string => {
+      let s = v == null ? '' : String(v);
+      if (/^[=+\-@]/.test(s)) s = `'${s}`;
+      return `"${s.replace(/"/g, '""')}"`;
+    };
+
+    const rows = (data || []).map((r: any) => [
+      new Date(r.created_at).toISOString(),
+      r.actor_email || 'system',
+      r.action,
+      r.entity_type,
+      r.entity_id || '',
+      r.summary || '',
+    ].map(cell).join(','));
+
+    const csv = [header.map(cell).join(','), ...rows].join('\r\n');
+    const stamp = new Date().toISOString().slice(0, 10);
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="nooi-audit-${stamp}.csv"`);
+    // Byte order mark, so Excel reads it as UTF-8 rather than mangling any
+    // non-ASCII business name.
+    return res.status(200).send('\uFEFF' + csv);
+  } catch (err) {
+    console.error('exportAuditLog error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
