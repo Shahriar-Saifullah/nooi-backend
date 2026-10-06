@@ -16,6 +16,7 @@ import {
   getVendorDocumentUrl,
   getAuditLog,
   exportAuditLog,
+  getVendorDirectory,
   decideVendorApplication,
 } from '../controllers/admin.controller';
 import { requireAdmin } from '../middleware/auth.middleware';
@@ -40,6 +41,7 @@ router.get('/stats', requireAdmin, getAdminStats);
 router.get('/vendors/queue', requireAdmin, getVendorQueue);
 router.get('/vendors', requireAdmin, listVendors);
 router.get('/vendors/:id/documents/:kind', requireAdmin, getVendorDocumentUrl);
+router.get('/vendors/directory', requireAdmin, getVendorDirectory);
 router.get('/vendors/:id', requireAdmin, getVendorById);
 router.get('/vendors/:id/review', requireAdmin, getVendorForReview);
 router.post('/vendors/:id/review/claim', requireAdmin, claimVendorReview);
