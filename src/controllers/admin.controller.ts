@@ -1292,3 +1292,192 @@ export async function exportAuditLog(req: AuthRequest, res: Response) {
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }
+
+/**
+ * Vendor directory — add to src/controllers/admin.controller.ts
+ * ============================================================================
+ * Route:  router.get('/vendors/directory', requireAdmin, getVendorDirectory);
+ *
+ * Declare it ABOVE /vendors/:id, like /vendors/queue — otherwise Express reads
+ * "directory" as an id.
+ *
+ * Two figures need stating, because both have more than one defensible answer:
+ *
+ *   GMV is GROSS, before commission. It is what customers paid for this
+ *   vendor's goods, and the commission rate sits next to it so the two are
+ *   never conflated. Netting it here would quietly answer a different question
+ *   — what Nooi owes them — which is the payouts screen's job.
+ *
+ *   Open orders counts ITEMS not yet delivered, by item_status. Not shipments:
+ *   an item can be 'processing' while its shipment is still 'label_pending',
+ *   and the question an admin is asking is "how much of this vendor's work is
+ *   outstanding", which is a count of goods, not parcels.
+ */
+
+const GMV_WINDOW_DAYS = 90;
+
+export async function getVendorDirectory(req: AuthRequest, res: Response) {
+  try {
+    const tab = (req.query.tab as string) || 'all';   // all|attention|approved|suspended
+    const search = req.query.search as string | undefined;
+
+    // Approved and suspended only. Pending and rejected applications belong to
+    // the approval queue — a directory of vendors who cannot trade is a
+    // different screen wearing this one's clothes.
+    let query = supabase
+      .from('vendor_profiles')
+      .select(`
+        id, business_name, store_name, business_email, city, country,
+        category, fulfillment_type, status, payout_connected,
+        legal_documents, verified_at, decided_at
+      `)
+      .in('status', ['approved', 'suspended']);
+
+    if (search) {
+      query = query.or(
+        `business_name.ilike.%${search}%,store_name.ilike.%${search}%,business_email.ilike.%${search}%,city.ilike.%${search}%`
+      );
+    }
+
+    const { data: vendors, error } = await query.order('business_name', { ascending: true });
+
+    if (error) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+
+    const vendorRows = vendors || [];
+    const vendorIds = vendorRows.map(v => v.id);
+
+    if (vendorIds.length === 0) {
+      return res.status(200).json({
+        success: true,
+        data: { vendors: [], counts: { all: 0, attention: 0, approved: 0, suspended: 0 } },
+      });
+    }
+
+    // ── Storefronts ──────────────────────────────────────────────────────
+    // One vendor can own several, which is why this is a map of arrays rather
+    // than a single retailer per vendor.
+    const { data: retailers } = await supabase
+      .from('retailers')
+      .select('id, name, vendor_id, commission_rate')
+      .in('vendor_id', vendorIds);
+
+    const retailersByVendor = new Map<string, any[]>();
+    const vendorByRetailer = new Map<string, string>();
+    for (const r of retailers || []) {
+      if (!r.vendor_id) continue;
+      const list = retailersByVendor.get(r.vendor_id) || [];
+      list.push(r);
+      retailersByVendor.set(r.vendor_id, list);
+      vendorByRetailer.set(r.id, r.vendor_id);
+    }
+
+    // ── Sales, in one pass ───────────────────────────────────────────────
+    // A query per vendor would be N round trips to answer one question. Pull
+    // the window once and fold it.
+    const since = new Date(Date.now() - GMV_WINDOW_DAYS * 86_400_000).toISOString();
+    const retailerIds = [...vendorByRetailer.keys()];
+
+    const gmvByVendor = new Map<string, number>();
+    const openByVendor = new Map<string, number>();
+
+    if (retailerIds.length > 0) {
+      const { data: items } = await supabase
+        .from('order_items')
+        .select('retailer_id, total_price, quantity, item_status, orders!inner(created_at, status)')
+        .in('retailer_id', retailerIds)
+        .gte('orders.created_at', since);
+
+      for (const it of (items || []) as any[]) {
+        const vendorId = vendorByRetailer.get(it.retailer_id);
+        if (!vendorId) continue;
+
+        // Cancelled and refunded orders are not revenue. Counting them would
+        // flatter a vendor whose goods keep coming back.
+        const orderStatus = it.orders?.status;
+        if (orderStatus === 'paid' || orderStatus === 'fulfilled') {
+          gmvByVendor.set(vendorId, (gmvByVendor.get(vendorId) || 0) + Number(it.total_price || 0));
+        }
+
+        if (it.item_status && it.item_status !== 'delivered' && it.item_status !== 'cancelled') {
+          openByVendor.set(vendorId, (openByVendor.get(vendorId) || 0) + Number(it.quantity || 0));
+        }
+      }
+    }
+
+    // ── Sign-in history ──────────────────────────────────────────────────
+    const { data: authData } = await supabase.auth.admin.listUsers({ perPage: 200 });
+    const lastSignInById = new Map(
+      (authData?.users || []).map((u: any) => [u.id, u.last_sign_in_at || null])
+    );
+
+    // ── Assemble ─────────────────────────────────────────────────────────
+    const rows = vendorRows.map(v => {
+      const docs = Array.isArray(v.legal_documents) ? v.legal_documents : [];
+      const storefronts = retailersByVendor.get(v.id) || [];
+
+      /**
+       * Why a vendor needs attention, as a list rather than a flag. An admin
+       * opening this screen wants to know what to do, and "needs attention"
+       * without a reason just moves the question along.
+       */
+      const issues: string[] = [];
+      if (docs.length === 0) issues.push('No documents');
+      if (!v.payout_connected) issues.push('No payout account');
+      if (storefronts.length === 0) issues.push('No storefront');
+      if (v.status === 'suspended') issues.push('Suspended');
+
+      return {
+        id: v.id,
+        business_name: v.business_name,
+        store_name: v.store_name,
+        business_email: v.business_email,
+        city: v.city,
+        country: v.country,
+        category: v.category,
+        fulfillment_type: v.fulfillment_type,
+        status: v.status,
+        payout_connected: v.payout_connected,
+        document_count: docs.length,
+        storefronts: storefronts.map(r => ({ id: r.id, name: r.name })),
+        // Several storefronts could carry different rates; show the range
+        // rather than picking one and being quietly wrong.
+        commission_rate: storefronts.length > 0
+          ? Number(storefronts[0].commission_rate ?? 0)
+          : null,
+        gmv_90d: Number((gmvByVendor.get(v.id) || 0).toFixed(2)),
+        open_items: openByVendor.get(v.id) || 0,
+        last_sign_in_at: lastSignInById.get(v.id) || null,
+        verified_at: v.verified_at,
+        issues,
+        needs_attention: issues.length > 0,
+      };
+    });
+
+    const counts = {
+      all: rows.length,
+      attention: rows.filter(r => r.needs_attention).length,
+      approved: rows.filter(r => r.status === 'approved').length,
+      suspended: rows.filter(r => r.status === 'suspended').length,
+    };
+
+    const filtered =
+      tab === 'attention' ? rows.filter(r => r.needs_attention)
+      : tab === 'approved' ? rows.filter(r => r.status === 'approved')
+      : tab === 'suspended' ? rows.filter(r => r.status === 'suspended')
+      : rows;
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        vendors: filtered,
+        counts,
+        gmv_window_days: GMV_WINDOW_DAYS,
+      },
+    });
+  } catch (err) {
+    console.error('getVendorDirectory error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
