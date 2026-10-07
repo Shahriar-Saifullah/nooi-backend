@@ -22,6 +22,10 @@ import {
   refundReturn,
   declineReturn,
   decideVendorApplication,
+  overrideOrderStatus,
+  getOrderForIntervention,
+  cancelOrderAsAdmin,
+  searchOrders,
 } from '../controllers/admin.controller';
 import { requireAdmin } from '../middleware/auth.middleware';
 import { validate } from '../middleware/validate';
@@ -69,5 +73,10 @@ router.get('/returns',              requireAdmin, getReturnsQueue);
 router.get('/returns/:id',          requireAdmin, getReturnForReview);
 router.post('/returns/:id/refund',  requireAdmin, refundReturn);
 router.post('/returns/:id/decline', requireAdmin, declineReturn);
+
+router.get('/orders',               requireAdmin, searchOrders);
+router.get('/orders/:id',           requireAdmin, getOrderForIntervention);
+router.post('/orders/:id/override', requireAdmin, overrideOrderStatus);
+router.post('/orders/:id/cancel',   requireAdmin, cancelOrderAsAdmin);
 
 export default router;

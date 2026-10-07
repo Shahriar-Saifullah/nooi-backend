@@ -1895,3 +1895,346 @@ export async function declineReturn(req: AuthRequest, res: Response) {
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }
+
+/**
+ * Order intervention — add to src/controllers/admin.controller.ts
+ * ============================================================================
+ * Routes:
+ *   router.get('/orders',                 requireAdmin, searchOrders);
+ *   router.get('/orders/:id',             requireAdmin, getOrderForIntervention);
+ *   router.post('/orders/:id/override',   requireAdmin, overrideOrderStatus);
+ *   router.post('/orders/:id/cancel',     requireAdmin, cancelOrderAsAdmin);
+ *
+ * Who can do what:
+ *
+ *   Override status  any admin. It changes a label, not money.
+ *   Cancel order     super_admin only. It refunds the customer, restores stock
+ *                    and stops every shipment. The design gates this behind
+ *                    "Operations or a super admin", and super_admin is the
+ *                    closest thing this system has — giving every admin the
+ *                    ability to refund a whole order by accident is the kind of
+ *                    permission you grant deliberately, not by default.
+ *
+ * Both require a reason. An intervention without one is indistinguishable from
+ * a mistake six weeks later, when someone asks why an order was cancelled.
+ */
+
+export async function searchOrders(req: AuthRequest, res: Response) {
+  try {
+    const q = String(req.query.q ?? '').trim();
+
+    let query = supabase
+      .from('orders')
+      .select(`
+        id, order_number, status, total_amount, created_at, shipping_address,
+        payment_intent_id, intervened_at
+      `)
+      .order('created_at', { ascending: false })
+      .limit(25);
+
+    if (q) {
+      // Order number or customer name. Email lives on auth.users, so a search
+      // that looks like an address is resolved to a user id first.
+      if (q.includes('@')) {
+        const { data: users } = await supabase.auth.admin.listUsers({ perPage: 200 });
+        const match = (users?.users || []).find((u: any) =>
+          u.email?.toLowerCase().includes(q.toLowerCase())
+        );
+        if (!match) {
+          return res.status(200).json({ success: true, data: { orders: [] } });
+        }
+        query = query.eq('user_id', match.id);
+      } else {
+        query = query.ilike('order_number', `%${q}%`);
+      }
+    }
+
+    const { data: orders, error } = await query;
+
+    if (error) return res.status(400).json({ success: false, error: error.message });
+
+    const rows = orders || [];
+    if (rows.length === 0) {
+      return res.status(200).json({ success: true, data: { orders: [] } });
+    }
+
+    // Vendor names, one query for the whole page.
+    const { data: shipments } = await supabase
+      .from('order_shipments')
+      .select('order_id, retailers ( name )')
+      .in('order_id', rows.map(o => o.id));
+
+    const vendorsByOrder = new Map<string, string[]>();
+    for (const s of (shipments || []) as any[]) {
+      const name = s.retailers?.name;
+      if (!name) continue;
+      const list = vendorsByOrder.get(s.order_id) || [];
+      if (!list.includes(name)) list.push(name);
+      vendorsByOrder.set(s.order_id, list);
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        orders: rows.map(o => ({
+          ...o,
+          customer_name: (o.shipping_address as any)?.fullName ?? null,
+          vendors: vendorsByOrder.get(o.id) || [],
+        })),
+      },
+    });
+  } catch (err) {
+    console.error('searchOrders error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+export async function getOrderForIntervention(req: AuthRequest, res: Response) {
+  try {
+    const id = req.params.id as string;
+
+    const { data: order, error } = await supabase
+      .from('orders')
+      .select(`
+        *,
+        order_items (
+          *,
+          product_variants ( sku, color, images, products ( title ) ),
+          retailers ( id, name )
+        ),
+        order_shipments (
+          *,
+          retailers ( id, name, city )
+        )
+      `)
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error) return res.status(400).json({ success: false, error: error.message });
+    if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
+
+    // Everything already done to this order, from the audit log. An admin about
+    // to intervene should see that someone else already has.
+    const { data: interventions } = await supabase
+      .from('admin_audit_log')
+      .select('id, action, summary, actor_email, created_at, metadata')
+      .eq('entity_id', id)
+      .order('created_at', { ascending: false });
+
+    // Returns against it, which change what is left to refund.
+    const { data: returns } = await supabase
+      .from('order_returns')
+      .select('id, status, reason, order_item_id, created_at')
+      .eq('order_id', id);
+
+    const refunded = (returns || []).filter((r: any) => r.status === 'refunded');
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        order: {
+          ...order,
+          customer_name: (order.shipping_address as any)?.fullName ?? null,
+        },
+        interventions: interventions || [],
+        returns: returns || [],
+        already_refunded_count: refunded.length,
+        // The client uses this to decide whether to offer Cancel at all.
+        viewer_can_cancel: req.userProfile?.role === 'super_admin',
+      },
+    });
+  } catch (err) {
+    console.error('getOrderForIntervention error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+export async function overrideOrderStatus(req: AuthRequest, res: Response) {
+  try {
+    const id = req.params.id as string;
+    const adminId = req.user?.id;
+    const status = String(req.body?.status ?? '');
+    const note = String(req.body?.note ?? '').trim();
+
+    if (!adminId) {
+      return res.status(401).json({ success: false, error: 'Authentication required' });
+    }
+    if (!note) {
+      return res.status(400).json({ success: false, error: 'A reason is required' });
+    }
+
+    const { data, error } = await supabase.rpc('override_order_status', {
+      p_order_id: id,
+      p_admin_id: adminId,
+      p_new_status: status,
+      p_note: note,
+    });
+
+    if (error) {
+      // The function raises on an unknown status rather than writing one.
+      if (error.message?.includes('INVALID_STATUS')) {
+        return res.status(400).json({
+          success: false,
+          error: 'Status must be paid, processing or fulfilled.',
+        });
+      }
+      return res.status(400).json({ success: false, error: error.message });
+    }
+
+    const row: any = Array.isArray(data) ? data[0] : data;
+    if (!row?.applied) {
+      return res.status(409).json({
+        success: false,
+        error: 'A cancelled order cannot be reopened by changing its status.',
+        data: { current_status: row?.final_status ?? null },
+      });
+    }
+
+    await supabase.from('admin_audit_log').insert({
+      actor_id: adminId,
+      actor_email: req.user?.email || null,
+      action: 'order.status_overridden',
+      entity_type: 'order',
+      entity_id: id,
+      summary: `Status set to ${status}: ${note.slice(0, 160)}`,
+      metadata: { status, note },
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: { status: row.final_status },
+      message: `Order status set to ${status}`,
+    });
+  } catch (err) {
+    console.error('overrideOrderStatus error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+export async function cancelOrderAsAdmin(req: AuthRequest, res: Response) {
+  const id = req.params.id as string;
+  const adminId = req.user?.id;
+  const note = String(req.body?.note ?? '').trim();
+
+  if (!adminId) {
+    return res.status(401).json({ success: false, error: 'Authentication required' });
+  }
+  // Refunding an entire order is not a default permission.
+  if (req.userProfile?.role !== 'super_admin') {
+    return res.status(403).json({
+      success: false,
+      error: 'Only a super administrator can cancel an order.',
+    });
+  }
+  if (!note) {
+    return res.status(400).json({ success: false, error: 'A reason is required' });
+  }
+
+  try {
+    const { data: order } = await supabase
+      .from('orders')
+      .select('id, order_number, payment_intent_id, user_id, status')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
+
+    // 1. Claim. Returns what is left to refund after any returns already paid.
+    const { data: claimData, error: claimError } = await supabase.rpc('claim_order_cancellation', {
+      p_order_id: id,
+      p_admin_id: adminId,
+    });
+
+    if (claimError) return res.status(400).json({ success: false, error: claimError.message });
+
+    const claim: any = Array.isArray(claimData) ? claimData[0] : claimData;
+    if (!claim?.claimed) {
+      return res.status(409).json({
+        success: false,
+        error: 'already_handled',
+        data: { current_status: claim?.current_status ?? null },
+      });
+    }
+
+    const amount = Number(claim.refundable ?? 0);
+
+    // 2. Refund, if there is anything left and a payment to refund against.
+    let refundId: string | null = null;
+    if (amount > 0 && order.payment_intent_id) {
+      try {
+        const refund = await stripe.refunds.create(
+          {
+            payment_intent: order.payment_intent_id,
+            amount: Math.round(amount * 100),
+            metadata: { order_id: id, order_number: order.order_number ?? '', reason: note.slice(0, 200) },
+          },
+          { idempotencyKey: `order-cancel-${id}` },
+        );
+        refundId = refund.id;
+      } catch (stripeErr: any) {
+        await supabase.rpc('settle_order_cancellation', {
+          p_order_id: id,
+          p_succeeded: false,
+          p_refund_id: null,
+          p_note: `Cancellation failed at refund: ${stripeErr?.message ?? 'unknown'}`,
+        });
+        console.error('[admin] cancel refund failed', { order_id: id, error: stripeErr?.message });
+        return res.status(502).json({
+          success: false,
+          error: stripeErr?.message || 'The payment provider rejected the refund.',
+        });
+      }
+    }
+
+    // 3. Settle: cancel the order, items and shipments, restore stock.
+    const { data: settled, error: settleError } = await supabase.rpc('settle_order_cancellation', {
+      p_order_id: id,
+      p_succeeded: true,
+      p_refund_id: refundId,
+      p_note: note,
+    });
+
+    if (settleError) {
+      console.error('[admin] cancel refunded but settle failed', {
+        order_id: id, refund_id: refundId, error: settleError.message,
+      });
+      return res.status(500).json({
+        success: false,
+        error: refundId
+          ? `The refund went through (${refundId}) but the order could not be updated. Do not cancel again — fix the record instead.`
+          : 'The order could not be cancelled.',
+      });
+    }
+
+    await supabase.from('admin_audit_log').insert({
+      actor_id: adminId,
+      actor_email: req.user?.email || null,
+      action: 'order.cancelled',
+      entity_type: 'order',
+      entity_id: id,
+      summary: `Cancelled ${order.order_number}${amount > 0 ? ` and refunded $${amount.toFixed(2)}` : ''}: ${note.slice(0, 140)}`,
+      metadata: { note, refund_amount: amount, refund_id: refundId },
+    });
+
+    if (order.user_id) {
+      await supabase.from('notifications').insert({
+        user_id: order.user_id,
+        title: `Order ${order.order_number} has been cancelled`,
+        message: amount > 0
+          ? `${note}\n\nWe've refunded $${amount.toFixed(2)}. It usually reaches your account within five working days.`
+          : note,
+        type: 'order_status',
+      });
+    }
+
+    const row: any = Array.isArray(settled) ? settled[0] : settled;
+    return res.status(200).json({
+      success: true,
+      data: { status: row?.final_status ?? 'cancelled', refund_id: refundId, refunded: amount },
+      message: amount > 0 ? `Cancelled and refunded $${amount.toFixed(2)}` : 'Order cancelled',
+    });
+  } catch (err) {
+    console.error('cancelOrderAsAdmin error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
