@@ -17,6 +17,10 @@ import {
   getAuditLog,
   exportAuditLog,
   getVendorDirectory,
+  getReturnsQueue,
+  getReturnForReview,
+  refundReturn,
+  declineReturn,
   decideVendorApplication,
 } from '../controllers/admin.controller';
 import { requireAdmin } from '../middleware/auth.middleware';
@@ -60,5 +64,10 @@ router.get('/team',         requireAdmin, getTeam);
 router.post('/team/invite', requireAdmin, inviteTeamMember);
 router.get('/audit',        requireAdmin, getAuditLog);
 router.get('/audit/export', requireAdmin, exportAuditLog);
+
+router.get('/returns',              requireAdmin, getReturnsQueue);
+router.get('/returns/:id',          requireAdmin, getReturnForReview);
+router.post('/returns/:id/refund',  requireAdmin, refundReturn);
+router.post('/returns/:id/decline', requireAdmin, declineReturn);
 
 export default router;

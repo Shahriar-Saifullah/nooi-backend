@@ -1,4 +1,5 @@
 import { Response } from 'express';
+import { stripe } from '../services/stripe';
 import { supabase } from '../services/supabase';
 import { AuthRequest } from '../types';
 import {
@@ -1478,6 +1479,419 @@ export async function getVendorDirectory(req: AuthRequest, res: Response) {
     });
   } catch (err) {
     console.error('getVendorDirectory error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+/**
+ * Returns and refunds — add to src/controllers/admin.controller.ts
+ * ============================================================================
+ * Routes:
+ *   router.get('/returns',            requireAdmin, getReturnsQueue);
+ *   router.get('/returns/:id',        requireAdmin, getReturnForReview);
+ *   router.post('/returns/:id/refund',requireAdmin, refundReturn);
+ *   router.post('/returns/:id/decline',requireAdmin, declineReturn);
+ *
+ * Needs, at the top of admin.controller.ts:
+ *   import { stripe } from '../services/stripe';
+ *
+ * Full-item refunds only in v1, per the design. The amount is always the item's
+ * total_price read from the database — never from the request body. A refund
+ * amount a client could name is a refund amount a client could choose.
+ *
+ * The sequence for a refund is deliberate:
+ *
+ *   1. claim_return_for_refund flips 'requested' → 'refunding' conditionally.
+ *      Only the caller that wins talks to Stripe.
+ *   2. Stripe refund.
+ *   3. settle_return_refund records the refund id, marks the item returned and
+ *      restores stock — or releases the row back to 'requested' if Stripe
+ *      failed.
+ *
+ * Doing it in the other order — refund first, update after — means a crash
+ * between the two leaves money gone with nothing recording it.
+ */
+
+/** What a returns row needs, with the order and goods it refers to. */
+const RETURN_COLUMNS = `
+  id, order_id, order_item_id, user_id, reason, photo_urls, status,
+  refund_amount, decided_by, decided_at, decision_note, stripe_refund_id,
+  created_at, updated_at
+`;
+
+export async function getReturnsQueue(req: AuthRequest, res: Response) {
+  try {
+    const tab = (req.query.tab as string) || 'requested';   // requested|done|all
+    const search = req.query.search as string | undefined;
+    const sort = (req.query.sort as string) || 'oldest';
+
+    let query = supabase.from('order_returns').select(RETURN_COLUMNS);
+
+    if (tab === 'done') query = query.in('status', ['refunded', 'declined']);
+    else if (tab !== 'all') query = query.eq('status', tab);
+
+    query = sort === 'newest'
+      ? query.order('created_at', { ascending: false })
+      : sort === 'value'
+        ? query.order('refund_amount', { ascending: false })
+        // Oldest first by default. A refund queue sorted newest first is how
+        // someone waits three weeks for their money.
+        : query.order('created_at', { ascending: true });
+
+    const { data: returns, error } = await query;
+
+    if (error) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+
+    const rows = returns || [];
+    if (rows.length === 0) {
+      return res.status(200).json({
+        success: true,
+        data: { returns: [], counts: { requested: 0, done: 0, all: 0 } },
+      });
+    }
+
+    // Enrich in two queries rather than per row.
+    const itemIds = [...new Set(rows.map(r => r.order_item_id).filter(Boolean))];
+    const orderIds = [...new Set(rows.map(r => r.order_id).filter(Boolean))];
+
+    const { data: items } = await supabase
+      .from('order_items')
+      .select(`
+        id, quantity, unit_price, total_price, item_status, retailer_id,
+        product_variants ( sku, color, images, products ( title ) ),
+        retailers ( name )
+      `)
+      .in('id', itemIds);
+
+    const { data: orders } = await supabase
+      .from('orders')
+      .select('id, order_number, payment_intent_id, total_amount, created_at, shipping_address')
+      .in('id', orderIds);
+
+    const itemById = new Map((items || []).map((i: any) => [i.id, i]));
+    const orderById = new Map((orders || []).map((o: any) => [o.id, o]));
+
+    const enriched = rows.map(r => {
+      const item: any = itemById.get(r.order_item_id);
+      const order: any = orderById.get(r.order_id);
+      return {
+        ...r,
+        item_title: item?.product_variants?.products?.title ?? 'Item',
+        item_variant: item?.product_variants?.color ?? null,
+        item_image: item?.product_variants?.images?.[0] ?? null,
+        item_quantity: item?.quantity ?? 0,
+        // Full-item refunds in v1, so the item's total IS the refund. Shown
+        // from the item rather than refund_amount, which is 0 on rows written
+        // before this screen existed.
+        amount: Number(item?.total_price ?? r.refund_amount ?? 0),
+        vendor_name: item?.retailers?.name ?? null,
+        order_number: order?.order_number ?? null,
+        customer_name: order?.shipping_address?.fullName ?? null,
+      };
+    });
+
+    const filtered = search
+      ? enriched.filter(r =>
+          [r.item_title, r.order_number, r.vendor_name, r.reason]
+            .filter(Boolean)
+            .some(v => String(v).toLowerCase().includes(search.toLowerCase()))
+        )
+      : enriched;
+
+    const { data: allStatuses } = await supabase.from('order_returns').select('status');
+    const counts = { requested: 0, done: 0, all: 0 };
+    for (const row of allStatuses || []) {
+      counts.all += 1;
+      if (row.status === 'requested' || row.status === 'refunding') counts.requested += 1;
+      else counts.done += 1;
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: { returns: filtered, counts },
+    });
+  } catch (err) {
+    console.error('getReturnsQueue error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+export async function getReturnForReview(req: AuthRequest, res: Response) {
+  try {
+    const id = req.params.id as string;
+
+    const { data: ret, error } = await supabase
+      .from('order_returns')
+      .select(RETURN_COLUMNS)
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error) return res.status(400).json({ success: false, error: error.message });
+    if (!ret) return res.status(404).json({ success: false, error: 'Return not found' });
+
+    const { data: item } = await supabase
+      .from('order_items')
+      .select(`
+        id, quantity, unit_price, total_price, item_status, retailer_id,
+        product_variants ( sku, color, material, images, products ( title ) ),
+        retailers ( id, name, city )
+      `)
+      .eq('id', ret.order_item_id)
+      .maybeSingle();
+
+    const { data: order } = await supabase
+      .from('orders')
+      .select('id, order_number, payment_intent_id, total_amount, subtotal, created_at, shipping_address, status')
+      .eq('id', ret.order_id)
+      .maybeSingle();
+
+    let deciderName: string | null = null;
+    if (ret.decided_by) {
+      const { data: p } = await supabase
+        .from('profiles').select('full_name').eq('id', ret.decided_by).maybeSingle();
+      deciderName = p?.full_name ?? null;
+    }
+
+    // Other returns on the same order. Three returns from one customer is a
+    // different conversation from one, and an admin should see that before
+    // deciding rather than after.
+    const { data: siblings } = await supabase
+      .from('order_returns')
+      .select('id, status, reason, created_at')
+      .eq('order_id', ret.order_id)
+      .neq('id', id);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        return: {
+          ...ret,
+          decided_by_name: deciderName,
+          amount: Number((item as any)?.total_price ?? ret.refund_amount ?? 0),
+        },
+        item,
+        order,
+        other_returns_on_order: siblings || [],
+        // Nothing can be refunded without this.
+        refundable: Boolean((order as any)?.payment_intent_id),
+      },
+    });
+  } catch (err) {
+    console.error('getReturnForReview error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+export async function refundReturn(req: AuthRequest, res: Response) {
+  const id = req.params.id as string;
+  const adminId = req.user?.id;
+
+  if (!adminId) {
+    return res.status(401).json({ success: false, error: 'Authentication required' });
+  }
+
+  try {
+    // What we are refunding, read from the database. Never the request body.
+    const { data: ret } = await supabase
+      .from('order_returns')
+      .select('id, order_id, order_item_id, status')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (!ret) return res.status(404).json({ success: false, error: 'Return not found' });
+
+    const { data: item } = await supabase
+      .from('order_items')
+      .select('id, total_price, quantity')
+      .eq('id', ret.order_item_id)
+      .maybeSingle();
+
+    const { data: order } = await supabase
+      .from('orders')
+      .select('id, order_number, payment_intent_id')
+      .eq('id', ret.order_id)
+      .maybeSingle();
+
+    if (!order?.payment_intent_id) {
+      return res.status(400).json({
+        success: false,
+        error: 'This order has no payment to refund against.',
+      });
+    }
+
+    const amount = Number(item?.total_price ?? 0);
+    if (!(amount > 0)) {
+      return res.status(400).json({ success: false, error: 'Nothing to refund on this item.' });
+    }
+
+    // 1. Claim. Only the caller that wins this talks to Stripe.
+    const { data: claimData, error: claimError } = await supabase.rpc('claim_return_for_refund', {
+      p_return_id: id,
+      p_admin_id: adminId,
+    });
+
+    if (claimError) {
+      return res.status(400).json({ success: false, error: claimError.message });
+    }
+
+    const claim: any = Array.isArray(claimData) ? claimData[0] : claimData;
+    if (!claim?.claimed) {
+      return res.status(409).json({
+        success: false,
+        error: 'already_handled',
+        data: { current_status: claim?.current_status ?? null },
+      });
+    }
+
+    // 2. Stripe. Idempotency key so a retry after a timeout cannot double-pay:
+    //    Stripe returns the original refund rather than making a second one.
+    let refundId: string;
+    try {
+      const refund = await stripe.refunds.create(
+        {
+          payment_intent: order.payment_intent_id,
+          amount: Math.round(amount * 100),
+          metadata: {
+            return_id: id,
+            order_number: order.order_number ?? '',
+            order_item_id: ret.order_item_id ?? '',
+          },
+        },
+        { idempotencyKey: `return-refund-${id}` },
+      );
+      refundId = refund.id;
+    } catch (stripeErr: any) {
+      // 3a. Release. Nobody was refunded, so the request is as valid as before.
+      await supabase.rpc('settle_return_refund', {
+        p_return_id: id,
+        p_succeeded: false,
+        p_refund_id: null,
+        p_note: `Refund attempt failed: ${stripeErr?.message ?? 'unknown error'}`,
+      });
+
+      console.error('[admin] stripe refund failed', { return_id: id, error: stripeErr?.message });
+      return res.status(502).json({
+        success: false,
+        error: stripeErr?.message || 'The payment provider rejected the refund.',
+      });
+    }
+
+    // 3b. Settle: record the refund, mark the item returned, restore stock.
+    const { data: settled, error: settleError } = await supabase.rpc('settle_return_refund', {
+      p_return_id: id,
+      p_succeeded: true,
+      p_refund_id: refundId,
+      p_note: null,
+    });
+
+    if (settleError) {
+      // The money has moved. Say so loudly rather than reporting a plain
+      // failure, because the customer HAS been refunded and the record has not
+      // caught up.
+      console.error('[admin] refund succeeded but settle failed', {
+        return_id: id, refund_id: refundId, error: settleError.message,
+      });
+      return res.status(500).json({
+        success: false,
+        error: `The refund went through (${refundId}) but the record could not be updated. Do not refund again — fix the record instead.`,
+      });
+    }
+
+    await supabase.from('admin_audit_log').insert({
+      actor_id: adminId,
+      actor_email: req.user?.email || null,
+      action: 'refund.issued',
+      entity_type: 'order_return',
+      entity_id: id,
+      summary: `Refunded $${amount.toFixed(2)} on ${order.order_number}`,
+      metadata: { amount, refund_id: refundId, order_id: ret.order_id },
+    });
+
+    await supabase.from('notifications').insert({
+      user_id: (await supabase.from('order_returns').select('user_id').eq('id', id).maybeSingle()).data?.user_id,
+      title: 'Your refund is on its way',
+      message: `We've refunded $${amount.toFixed(2)} for your return on ${order.order_number}. It usually reaches your account within five working days.`,
+      type: 'return',
+    });
+
+    const row: any = Array.isArray(settled) ? settled[0] : settled;
+    return res.status(200).json({
+      success: true,
+      data: { status: row?.final_status ?? 'refunded', refund_id: refundId, amount },
+      message: `Refunded $${amount.toFixed(2)}`,
+    });
+  } catch (err) {
+    console.error('refundReturn error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+export async function declineReturn(req: AuthRequest, res: Response) {
+  try {
+    const id = req.params.id as string;
+    const adminId = req.user?.id;
+    const note = String(req.body?.note ?? '').trim();
+
+    if (!adminId) {
+      return res.status(401).json({ success: false, error: 'Authentication required' });
+    }
+    // A decline the customer cannot understand becomes a support ticket and
+    // then a chargeback. Make the reason mandatory here, not in the UI.
+    if (!note) {
+      return res.status(400).json({
+        success: false,
+        error: 'A reason is required — the customer sees it.',
+      });
+    }
+
+    const { data, error } = await supabase.rpc('decline_return', {
+      p_return_id: id,
+      p_admin_id: adminId,
+      p_note: note,
+    });
+
+    if (error) return res.status(400).json({ success: false, error: error.message });
+
+    const row: any = Array.isArray(data) ? data[0] : data;
+    if (!row?.applied) {
+      return res.status(409).json({
+        success: false,
+        error: 'already_handled',
+        data: { current_status: row?.current_status ?? null },
+      });
+    }
+
+    const { data: ret } = await supabase
+      .from('order_returns').select('user_id, order_id').eq('id', id).maybeSingle();
+
+    await supabase.from('admin_audit_log').insert({
+      actor_id: adminId,
+      actor_email: req.user?.email || null,
+      action: 'refund.declined',
+      entity_type: 'order_return',
+      entity_id: id,
+      summary: `Declined return: ${note.slice(0, 160)}`,
+      metadata: { note },
+    });
+
+    if (ret?.user_id) {
+      await supabase.from('notifications').insert({
+        user_id: ret.user_id,
+        title: 'About your return request',
+        message: note,
+        type: 'return',
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: { status: 'declined' },
+      message: 'Return declined',
+    });
+  } catch (err) {
+    console.error('declineReturn error:', err);
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }
