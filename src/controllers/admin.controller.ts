@@ -2149,10 +2149,23 @@ export async function cancelOrderAsAdmin(req: AuthRequest, res: Response) {
 
     const claim: any = Array.isArray(claimData) ? claimData[0] : claimData;
     if (!claim?.claimed) {
+      const current = claim?.current_status ?? null;
+ 
+      // Genuinely settled — someone else got there, or it was already done.
+      if (current === 'cancelled' || current === 'cancelling' || current === 'refunded') {
+        return res.status(409).json({
+          success: false,
+          error: 'already_handled',
+          data: { current_status: current },
+        });
+      }
+ 
+      // Anything else: the order is in a state this function will not claim.
+      // Say which, rather than implying a colleague acted.
       return res.status(409).json({
         success: false,
-        error: 'already_handled',
-        data: { current_status: claim?.current_status ?? null },
+        error: `An order with status "${current}" cannot be cancelled.`,
+        data: { current_status: current },
       });
     }
 
