@@ -116,3 +116,440 @@ export async function getVendorDashboardSummary(req: AuthRequest, res: Response)
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }
+
+/**
+ * Vendor orders and dispatch — add to src/controllers/vendor.controller.ts
+ * ============================================================================
+ * NOOI-69's write path. Until this exists every shipment sits at
+ * label_pending forever, the shopper's tracking timeline never moves, and
+ * carrier polling has nothing to poll.
+ *
+ * Routes (vendor.routes.ts):
+ *   router.get('/orders',                       requireVendor, getVendorOrders);
+ *   router.get('/orders/:shipmentId',           requireVendor, getVendorShipment);
+ *   router.post('/orders/:shipmentId/dispatch', requireVendor, dispatchShipment);
+ *   router.post('/orders/:shipmentId/status',   requireVendor, advanceShipmentStatus);
+ *
+ * A vendor acts on SHIPMENTS, not orders. order_shipments is already one row
+ * per vendor, so filtering by their retailer gives exactly their slice — they
+ * never see what the customer bought from anyone else, or the order total.
+ *
+ * The shipping address is the exception: they need it to post the goods, so it
+ * comes from the parent order. Only that field — total_amount, discount_amount
+ * and payment_intent_id live on the same row and are none of their business.
+ */
+
+/** Carriers worth accepting. Extend as real ones are onboarded. */
+const CARRIERS: Record<string, { name: string; trackingUrl: (n: string) => string }> = {
+  ARAMEX:  { name: 'Aramex',  trackingUrl: n => `https://www.aramex.com/track/results?ShipmentNumber=${n}` },
+  DHL:     { name: 'DHL',     trackingUrl: n => `https://www.dhl.com/en/express/tracking.html?AWB=${n}` },
+  FEDEX:   { name: 'FedEx',   trackingUrl: n => `https://www.fedex.com/fedextrack/?trknbr=${n}` },
+  UPS:     { name: 'UPS',     trackingUrl: n => `https://www.ups.com/track?tracknum=${n}` },
+  SMSA:    { name: 'SMSA',    trackingUrl: n => `https://www.smsaexpress.com/trackingdetails?tracknumbers=${n}` },
+  NAQEL:   { name: 'Naqel',   trackingUrl: n => `https://www.naqelexpress.com/en/track?waybill=${n}` },
+  OTHER:   { name: 'Other',   trackingUrl: () => '' },
+};
+
+/** Forward order. A vendor may move along it, never back. */
+const PROGRESSION = [
+  'label_pending', 'label_created', 'in_transit', 'out_for_delivery', 'delivered',
+] as const;
+
+/** The retailers this vendor owns. Every query is scoped through this. */
+async function vendorRetailerIds(vendorId: string): Promise<string[]> {
+  const { data } = await supabase
+    .from('retailers')
+    .select('id')
+    .eq('vendor_id', vendorId);
+  return (data || []).map((r: any) => r.id);
+}
+
+export async function getVendorOrders(req: AuthRequest, res: Response) {
+  try {
+    const vendorId = req.user?.id;
+    if (!vendorId) {
+      return res.status(401).json({ success: false, error: 'Authentication required' });
+    }
+
+    const tab = (req.query.tab as string) || 'to_fulfil';   // to_fulfil|shipped|delivered|all
+    const retailerIds = await vendorRetailerIds(vendorId);
+
+    if (retailerIds.length === 0) {
+      // Approved but no storefront, or not approved at all. Not an error —
+      // they simply have nothing yet.
+      return res.status(200).json({
+        success: true,
+        data: { shipments: [], counts: { to_fulfil: 0, shipped: 0, delivered: 0, all: 0 } },
+      });
+    }
+
+    let query = supabase
+      .from('order_shipments')
+      .select(`
+        id, order_id, retailer_id, carrier_code, tracking_number, tracking_url,
+        shipment_status, estimated_delivery, dispatched_at, delivered_at,
+        exception_code, exception_note, created_at,
+        orders ( id, order_number, created_at, shipping_address, status )
+      `)
+      .in('retailer_id', retailerIds);
+
+    if (tab === 'to_fulfil') {
+      query = query.in('shipment_status', ['label_pending', 'label_created']);
+    } else if (tab === 'shipped') {
+      query = query.in('shipment_status', ['in_transit', 'out_for_delivery']);
+    } else if (tab === 'delivered') {
+      query = query.eq('shipment_status', 'delivered');
+    }
+
+    // Oldest first. A fulfilment queue sorted newest first is how an order sits
+    // for three weeks while fresher ones get picked.
+    const { data: shipments, error } = await query.order('created_at', { ascending: true });
+
+    if (error) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+
+    const rows = shipments || [];
+
+    // Their items only — one query, grouped after.
+    const orderIds = [...new Set(rows.map((s: any) => s.order_id))];
+    const { data: items } = orderIds.length
+      ? await supabase
+          .from('order_items')
+          .select(`
+            id, order_id, retailer_id, quantity, unit_price, total_price, item_status,
+            product_variants ( sku, color, images, products ( title ) )
+          `)
+          .in('order_id', orderIds)
+          .in('retailer_id', retailerIds)
+      : { data: [] as any[] };
+
+    const itemsByOrder = new Map<string, any[]>();
+    for (const it of (items || []) as any[]) {
+      const list = itemsByOrder.get(it.order_id) || [];
+      list.push(it);
+      itemsByOrder.set(it.order_id, list);
+    }
+
+    const shaped = rows.map((s: any) => {
+      const mine = (itemsByOrder.get(s.order_id) || []).filter(i => i.retailer_id === s.retailer_id);
+      const addr = s.orders?.shipping_address || {};
+      return {
+        id: s.id,
+        order_number: s.orders?.order_number ?? null,
+        placed_at: s.orders?.created_at ?? s.created_at,
+        shipment_status: s.shipment_status,
+        carrier_code: s.carrier_code,
+        tracking_number: s.tracking_number,
+        tracking_url: s.tracking_url,
+        estimated_delivery: s.estimated_delivery,
+        dispatched_at: s.dispatched_at,
+        delivered_at: s.delivered_at,
+        exception_code: s.exception_code,
+        exception_note: s.exception_note,
+        // Only what is needed to post a parcel. Deliberately not the order
+        // total, the discount or the payment reference.
+        deliver_to: {
+          name: addr.fullName ?? null,
+          street: addr.street ?? null,
+          city: addr.city ?? null,
+          state: addr.state ?? null,
+          postcode: addr.zipCode ?? null,
+          country: addr.country ?? null,
+        },
+        items: mine.map((i: any) => ({
+          id: i.id,
+          title: i.product_variants?.products?.title ?? 'Item',
+          color: i.product_variants?.color ?? null,
+          sku: i.product_variants?.sku ?? null,
+          image: i.product_variants?.images?.[0] ?? null,
+          quantity: i.quantity,
+          item_status: i.item_status,
+        })),
+        item_count: mine.reduce((n: number, i: any) => n + (i.quantity ?? 0), 0),
+        // What this shipment is worth to THEM, not the order total.
+        value: Number(mine.reduce((n: number, i: any) => n + Number(i.total_price ?? 0), 0).toFixed(2)),
+      };
+    });
+
+    // Counts from the same source as the rows, so a tab can never claim a
+    // number the list fails to produce.
+    const { data: allStatuses } = await supabase
+      .from('order_shipments')
+      .select('shipment_status')
+      .in('retailer_id', retailerIds);
+
+    const counts = { to_fulfil: 0, shipped: 0, delivered: 0, all: 0 };
+    for (const r of (allStatuses || []) as any[]) {
+      counts.all += 1;
+      if (['label_pending', 'label_created'].includes(r.shipment_status)) counts.to_fulfil += 1;
+      else if (['in_transit', 'out_for_delivery'].includes(r.shipment_status)) counts.shipped += 1;
+      else if (r.shipment_status === 'delivered') counts.delivered += 1;
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: { shipments: shaped, counts, carriers: Object.keys(CARRIERS) },
+    });
+  } catch (err) {
+    console.error('getVendorOrders error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+export async function getVendorShipment(req: AuthRequest, res: Response) {
+  try {
+    const vendorId = req.user?.id;
+    const shipmentId = req.params.shipmentId as string;
+    if (!vendorId) {
+      return res.status(401).json({ success: false, error: 'Authentication required' });
+    }
+
+    const retailerIds = await vendorRetailerIds(vendorId);
+
+    const { data: shipment, error } = await supabase
+      .from('order_shipments')
+      .select(`
+        *,
+        orders ( order_number, created_at, shipping_address ),
+        order_tracking_events ( id, status, location, description, timestamp )
+      `)
+      .eq('id', shipmentId)
+      .in('retailer_id', retailerIds)   // scoping, not filtering
+      .maybeSingle();
+
+    if (error) return res.status(400).json({ success: false, error: error.message });
+    // Not found and not yours are the same answer on purpose — otherwise the
+    // response tells a vendor whether someone else's shipment id is real.
+    if (!shipment) {
+      return res.status(404).json({ success: false, error: 'Shipment not found' });
+    }
+
+    const { data: items } = await supabase
+      .from('order_items')
+      .select(`
+        id, quantity, unit_price, total_price, item_status,
+        product_variants ( sku, color, material, images, products ( title ) )
+      `)
+      .eq('order_id', shipment.order_id)
+      .eq('retailer_id', shipment.retailer_id);
+
+    return res.status(200).json({
+      success: true,
+      data: { shipment, items: items || [], carriers: CARRIERS },
+    });
+  } catch (err) {
+    console.error('getVendorShipment error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+/**
+ * Mark a shipment dispatched.
+ *
+ * This is the moment a tracking number comes into existence. Before it, the
+ * shipment has none and carrier polling correctly ignores it; after, polling
+ * picks it up on the next run.
+ *
+ * Conditional on the shipment still being pre-dispatch, so two people in the
+ * same warehouse cannot both dispatch it and overwrite each other's tracking
+ * number.
+ */
+export async function dispatchShipment(req: AuthRequest, res: Response) {
+  try {
+    const vendorId = req.user?.id;
+    const shipmentId = req.params.shipmentId as string;
+    const { carrier_code, tracking_number, service_code } = req.body || {};
+
+    if (!vendorId) {
+      return res.status(401).json({ success: false, error: 'Authentication required' });
+    }
+
+    const carrier = String(carrier_code || '').toUpperCase();
+    if (!CARRIERS[carrier]) {
+      return res.status(400).json({
+        success: false,
+        error: `Carrier must be one of: ${Object.keys(CARRIERS).join(', ')}`,
+      });
+    }
+
+    const tracking = String(tracking_number || '').trim();
+    if (!tracking) {
+      return res.status(400).json({ success: false, error: 'A tracking number is required' });
+    }
+    // Carriers vary, so this is a sanity check rather than a format rule — but
+    // a two-character entry is a mistake, and polling it forever helps nobody.
+    if (tracking.length < 6) {
+      return res.status(400).json({
+        success: false,
+        error: 'That tracking number looks too short. Check it and try again.',
+      });
+    }
+
+    const retailerIds = await vendorRetailerIds(vendorId);
+
+    const { data: updated, error } = await supabase
+      .from('order_shipments')
+      .update({
+        carrier_code: carrier,
+        tracking_number: tracking,
+        service_code: service_code || null,
+        tracking_url: CARRIERS[carrier].trackingUrl(tracking) || null,
+        shipment_status: 'in_transit',
+        dispatched_at: new Date().toISOString(),
+        // A redispatch clears any previous exception and poll history — this is
+        // effectively a new parcel as far as the carrier is concerned.
+        exception_code: null,
+        exception_note: null,
+        poll_failures: 0,
+        last_polled_at: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', shipmentId)
+      .in('retailer_id', retailerIds)
+      .in('shipment_status', ['label_pending', 'label_created'])
+      .select('id, shipment_status, carrier_code, tracking_number, tracking_url, order_id, retailer_id')
+      .maybeSingle();
+
+    if (error) return res.status(400).json({ success: false, error: error.message });
+
+    if (!updated) {
+      // Either not theirs, or already dispatched. Distinguish, because the
+      // second is routine and the first is not.
+      const { data: existing } = await supabase
+        .from('order_shipments')
+        .select('shipment_status')
+        .eq('id', shipmentId)
+        .in('retailer_id', retailerIds)
+        .maybeSingle();
+
+      if (!existing) {
+        return res.status(404).json({ success: false, error: 'Shipment not found' });
+      }
+      return res.status(409).json({
+        success: false,
+        error: `This shipment is already ${String(existing.shipment_status).replace(/_/g, ' ')}.`,
+      });
+    }
+
+    // Their items are on the way too.
+    await supabase
+      .from('order_items')
+      .update({ item_status: 'shipped' })
+      .eq('order_id', updated.order_id)
+      .eq('retailer_id', updated.retailer_id)
+      .not('item_status', 'in', '("returned","cancelled")');
+
+    // First event on the timeline. Carrier scans will add to it from here.
+    await supabase.from('order_tracking_events').insert({
+      shipment_id: shipmentId,
+      status: 'in_transit',
+      description: `Dispatched with ${CARRIERS[carrier].name}`,
+      timestamp: new Date().toISOString(),
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: updated,
+      message: `Dispatched with ${CARRIERS[carrier].name}`,
+    });
+  } catch (err) {
+    console.error('dispatchShipment error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+/**
+ * Move a shipment along by hand.
+ *
+ * Carrier polling will do this automatically once NOOI-61 lands, but a vendor
+ * delivering their own goods, or using a carrier Nooi cannot poll, needs to say
+ * so. Forward only: a delivered parcel does not become in-transit because
+ * someone picked the wrong row.
+ */
+export async function advanceShipmentStatus(req: AuthRequest, res: Response) {
+  try {
+    const vendorId = req.user?.id;
+    const shipmentId = req.params.shipmentId as string;
+    const { status, note } = req.body || {};
+
+    if (!vendorId) {
+      return res.status(401).json({ success: false, error: 'Authentication required' });
+    }
+
+    const target = String(status || '');
+    const targetIndex = PROGRESSION.indexOf(target as typeof PROGRESSION[number]);
+    if (targetIndex === -1) {
+      return res.status(400).json({
+        success: false,
+        error: `Status must be one of: ${PROGRESSION.join(', ')}`,
+      });
+    }
+
+    const retailerIds = await vendorRetailerIds(vendorId);
+
+    const { data: current } = await supabase
+      .from('order_shipments')
+      .select('id, shipment_status, order_id, retailer_id')
+      .eq('id', shipmentId)
+      .in('retailer_id', retailerIds)
+      .maybeSingle();
+
+    if (!current) {
+      return res.status(404).json({ success: false, error: 'Shipment not found' });
+    }
+
+    const currentIndex = PROGRESSION.indexOf(current.shipment_status as typeof PROGRESSION[number]);
+    if (currentIndex === -1) {
+      return res.status(409).json({
+        success: false,
+        error: `A ${current.shipment_status} shipment cannot be moved from here.`,
+      });
+    }
+    if (targetIndex <= currentIndex) {
+      return res.status(409).json({
+        success: false,
+        error: `This shipment is already ${String(current.shipment_status).replace(/_/g, ' ')}.`,
+      });
+    }
+
+    const patch: Record<string, any> = {
+      shipment_status: target,
+      updated_at: new Date().toISOString(),
+    };
+    if (target === 'delivered') patch.delivered_at = new Date().toISOString();
+
+    const { error } = await supabase
+      .from('order_shipments')
+      .update(patch)
+      .eq('id', shipmentId)
+      .in('retailer_id', retailerIds);
+
+    if (error) return res.status(400).json({ success: false, error: error.message });
+
+    if (target === 'delivered') {
+      await supabase
+        .from('order_items')
+        .update({ item_status: 'delivered' })
+        .eq('order_id', current.order_id)
+        .eq('retailer_id', current.retailer_id)
+        .not('item_status', 'in', '("returned","cancelled")');
+    }
+
+    await supabase.from('order_tracking_events').insert({
+      shipment_id: shipmentId,
+      status: target,
+      description: note ? String(note).slice(0, 200) : `Marked ${target.replace(/_/g, ' ')} by vendor`,
+      timestamp: new Date().toISOString(),
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: { shipment_status: target },
+      message: `Shipment marked ${target.replace(/_/g, ' ')}`,
+    });
+  } catch (err) {
+    console.error('advanceShipmentStatus error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
