@@ -510,7 +510,7 @@ export const getOrderByPaymentIntent = async (req: Request, res: Response) => {
           *,
           product_variants (
             id, sku, color, material, images,
-            products ( id, title, canvas_model_id )
+            products ( id, title, canvas_model_id, is_returnable )
           )
         ),
         order_shipments (
@@ -620,7 +620,7 @@ export const getOrderById = async (req: Request, res: Response) => {
           *,
           product_variants (
             id, sku, color, material, images,
-            products ( id, title, canvas_model_id )
+            products ( id, title, canvas_model_id, is_returnable )
           )
         ),
         order_shipments (
@@ -646,6 +646,31 @@ export const getOrderById = async (req: Request, res: Response) => {
   }
 };
 
+/**
+ * Replace submitReturnRequest in src/controllers/orders.controller.ts
+ * ============================================================================
+ * The previous version took order_id from the URL and order_item_id from the
+ * body and inserted a row. No ownership check, no eligibility check, no
+ * duplicate check.
+ *
+ * That meant any authenticated user could raise a return against anyone's
+ * order by changing the id in the URL. An admin would then see it in the
+ * refunds queue with a plausible reason and refund it — the money goes back to
+ * the real buyer, so this is griefing rather than theft, but it is still
+ * someone else's order being cancelled by a stranger.
+ *
+ * Five things are checked now, in the order a person would check them:
+ *
+ *   1. The order is this user's.
+ *   2. The item is on that order.
+ *   3. It has actually been delivered.
+ *   4. The product is returnable at all.
+ *   5. It is within the window, and no return already exists.
+ */
+
+/** Days after delivery during which a return may be raised. */
+const RETURN_WINDOW_DAYS = 30;
+
 export const submitReturnRequest = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -655,19 +680,122 @@ export const submitReturnRequest = async (req: Request, res: Response) => {
     if (!userId) {
       return res.status(401).json({ success: false, error: 'Authentication required' });
     }
+    if (!order_item_id) {
+      return res.status(400).json({ success: false, error: 'An item is required' });
+    }
+    if (!String(reason ?? '').trim()) {
+      return res.status(400).json({ success: false, error: 'A reason is required' });
+    }
 
-    const returnRecord = {
-      order_id: id,
-      order_item_id,
-      user_id: userId,
-      reason,
-      photo_urls,
-      status: 'requested',
-    };
+    // 1. The order is this user's.
+    //
+    // Scoped by user_id rather than fetched then compared, so a missing order
+    // and someone else's order give the same answer — otherwise the response
+    // tells a caller whether an order id they guessed is real.
+    const { data: order } = await supabase
+      .from('orders')
+      .select('id, order_number, status')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (!order) {
+      return res.status(404).json({ success: false, error: 'Order not found' });
+    }
+
+    // 2. The item is on that order, with the product behind it.
+    const { data: item } = await supabase
+      .from('order_items')
+      .select(`
+        id, order_id, retailer_id, item_status, quantity,
+        products ( id, title, is_returnable, specs_json )
+      `)
+      .eq('id', order_item_id)
+      .eq('order_id', id)
+      .maybeSingle();
+
+    if (!item) {
+      return res.status(404).json({ success: false, error: 'That item is not on this order' });
+    }
+
+    // 3. Delivered, by the shipment that carried it.
+    //
+    // item_status can lag — a vendor marks a shipment delivered and the items
+    // follow — so the shipment is the authority on whether the goods arrived.
+    const { data: shipment } = await supabase
+      .from('order_shipments')
+      .select('shipment_status, delivered_at')
+      .eq('order_id', id)
+      .eq('retailer_id', item.retailer_id)
+      .maybeSingle();
+
+    if (shipment?.shipment_status !== 'delivered') {
+      return res.status(400).json({
+        success: false,
+        error: 'You can raise a return once this item has been delivered.',
+      });
+    }
+
+    // 4. Returnable at all.
+    //
+    // Read from the column, not from specs_json. A made-to-order piece was
+    // built for this customer and cannot be resold, which is why the answer has
+    // to be stable rather than parsed from a label the listing form writes.
+    const product: any = item.products;
+    if (product && product.is_returnable === false) {
+      const kind = product.specs_json?.kind;
+      return res.status(400).json({
+        success: false,
+        error: kind
+          ? `${kind} items can't be returned — they're made for your order. Contact support if something arrived damaged.`
+          : "This item can't be returned. Contact support if something arrived damaged.",
+      });
+    }
+
+    // 5. Within the window.
+    //
+    // Measured from delivery, not from the order date: a piece with a 28-day
+    // lead time would otherwise have almost no window left by the time it
+    // arrived.
+    const deliveredAt = shipment.delivered_at ? new Date(shipment.delivered_at) : null;
+    if (deliveredAt) {
+      const days = Math.floor((Date.now() - deliveredAt.getTime()) / 86_400_000);
+      if (days > RETURN_WINDOW_DAYS) {
+        return res.status(400).json({
+          success: false,
+          error: `Returns close ${RETURN_WINDOW_DAYS} days after delivery. This arrived ${days} days ago.`,
+        });
+      }
+    }
+
+    // And not twice. Without this a customer can raise five requests on one
+    // item and an admin can refund each of them.
+    const { data: existing } = await supabase
+      .from('order_returns')
+      .select('id, status')
+      .eq('order_item_id', order_item_id)
+      .not('status', 'eq', 'declined')
+      .maybeSingle();
+
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        error: existing.status === 'refunded'
+          ? 'This item has already been refunded.'
+          : 'A return is already open for this item.',
+      });
+    }
 
     const { data, error } = await supabase
       .from('order_returns')
-      .insert(returnRecord)
+      .insert({
+        order_id: id,
+        order_item_id,
+        user_id: userId,
+        reason: String(reason).trim(),
+        photo_urls,
+        status: 'requested',
+      })
       .select()
       .single();
 
@@ -677,6 +805,7 @@ export const submitReturnRequest = async (req: Request, res: Response) => {
 
     return res.json({ success: true, return_request: data });
   } catch (err: any) {
-    return res.status(500).json({ success: false, error: err.message });
+    console.error('submitReturnRequest error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
