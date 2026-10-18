@@ -170,6 +170,20 @@ export const renderSceneSchema = z.object({
   scene_image: z.string().min(100).max(12_000_000), // data URL of the capture
   // grayscale depth map of the same view; used when RENDER_MODE=depth
   depth_image: z.string().min(100).max(12_000_000).optional(),
+  // What is actually in the room, from the canvas.
+  //
+  // Telling the model what IS present anchors it far better than a negative
+  // prompt listing what must not change — "a dusty-pink armchair, a grey
+  // three-seat sofa" gives it something to preserve, where "do not change the
+  // furniture" only gives it something to ignore.
+  //
+  // Capped at 24: beyond that the prompt gets long enough to dilute itself,
+  // and the biggest items are the ones that matter.
+  furniture: z.array(z.object({
+    name: z.string().max(80),
+    color: z.string().max(40).optional(),
+    material: z.string().max(40).optional(),
+  })).max(24).optional(),
 });
 
 // ── NOOI-10: wall editing ────────────────────────────────────────────────────

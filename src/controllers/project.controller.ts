@@ -1317,8 +1317,9 @@ export async function renderScene(req: AuthRequest, res: Response) {
   try {
     const userId    = req.user!.id;
     const projectId = String(req.params.id);
-    const { prompt, scene_image, depth_image } = req.body as {
+    const { prompt, scene_image, depth_image, furniture } = req.body as {
       prompt?: string; scene_image: string; depth_image?: string;
+      furniture?: Array<{ name: string; color?: string; material?: string }>;
     };
 
     const project = await verifyOwnership(projectId, userId);
@@ -1340,6 +1341,48 @@ export async function renderScene(req: AuthRequest, res: Response) {
     // RENDER_MODE=color (default) → img2img on the colour capture
     // Switching back is an env var change, not a deploy. The frontend always
     // sends both images, so either path works at any time.
+    // ── What is actually in this room ────────────────────────────────────────
+    // The canvas knows every item the user placed, with its colour and
+    // material. Naming them gives the model something to PRESERVE; the
+    // negative prompt alone only gives it a list of things to ignore, and
+    // diffusion models are far better at following a positive instruction.
+    //
+    // Identical items are collapsed with a count ("2 × grey armchair") rather
+    // than repeated, which keeps the prompt short enough to stay effective.
+    const describeRoom = (): string => {
+      const items = Array.isArray(furniture) ? furniture : [];
+      if (items.length === 0) return '';
+
+      const counts = new Map<string, number>();
+      for (const it of items) {
+        const label = [it.color, it.material, it.name]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase()
+          .trim();
+        if (!label) continue;
+        counts.set(label, (counts.get(label) ?? 0) + 1);
+      }
+      if (counts.size === 0) return '';
+
+      const parts = [...counts.entries()].map(([label, n]) =>
+        n > 1 ? `${n} × ${label}` : `a ${label}`);
+      return `The room contains exactly: ${parts.join(', ')}. Keep each one — same type, same colour, same position.`;
+    };
+    const roomContents = describeRoom();
+
+    // A stable seed per project. Not per render: the point is that successive
+    // renders of the same room land on similar materials rather than a fresh
+    // invention each time.
+    const seedFromProjectId = (pid: string): number => {
+      let h = 2166136261;
+      for (let i = 0; i < pid.length; i++) {
+        h ^= pid.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      return Math.abs(h) % 2_147_483_647;
+    };
+
     const useDepth = (process.env.RENDER_MODE || 'color') === 'depth' && !!depth_image;
 
     const { default: Replicate } = await import('replicate');
@@ -1351,9 +1394,13 @@ export async function renderScene(req: AuthRequest, res: Response) {
     if (useDepth) {
       // A depth map carries no colour, so anything the user chose in 3D
       // (wall paint, furniture finish) must be restated in words.
+      // A depth map carries no colour at all, so without this list the model
+      // invents every material — which is how a grey sofa comes back as brown
+      // leather with the geometry still correct.
       const fullPrompt = [
         'Photorealistic interior photograph of this exact room.',
         'Follow the depth map precisely for room geometry, camera angle and furniture placement.',
+        roomContents,
         'High-end architectural photography, natural window light, realistic materials, physically based textures, 8k detail.',
         prompt ? `Style: ${prompt}` : 'Style: warm contemporary interior with natural materials.',
       ].filter(Boolean).join(' ');
@@ -1367,8 +1414,11 @@ export async function renderScene(req: AuthRequest, res: Response) {
         output_format: 'png',
       };
     } else {
+      // Contents go near the front: tokens early in a prompt carry more weight
+      // than tokens at the end, and this is the instruction that matters most.
       const fullPrompt = [
         'Photorealistic interior photograph of THIS room. Keep the existing room shape, camera angle, window and door positions, wall colours and every piece of furniture exactly where it is — same types, same sizes, same positions.',
+        roomContents,
         'Only upgrade materials, textures and lighting to look real: high-end architectural photography, natural window light, physically based materials, 8k detail.',
         'Do not add, remove, move or restyle furniture. Do not add chandeliers, curtains or decor that is not already present.',
         prompt ? `Style request: ${prompt}` : '',
@@ -1377,7 +1427,10 @@ export async function renderScene(req: AuthRequest, res: Response) {
       // How much the model may rewrite the capture. 0.8 (the old default)
       // preserves only the coarse layout; 0.5–0.6 keeps furniture, colours and
       // proportions much closer. Tune with RENDER_STRENGTH — no deploy needed.
-      const strength = Number(process.env.RENDER_STRENGTH ?? 0.55);
+      // 0.55 redraws more than half the image, which is enough to turn a grey
+      // sectional into a brown leather armchair. 0.35 keeps furniture and
+      // colours recognisably the user's own. Still tunable without a deploy.
+      const strength = Number(process.env.RENDER_STRENGTH ?? 0.35);
       const guidance = Number(process.env.RENDER_GUIDANCE ?? 12);
 
       model = process.env.REPLICATE_RENDER_MODEL ||
@@ -1385,6 +1438,10 @@ export async function renderScene(req: AuthRequest, res: Response) {
       input = {
         image: scene_image,
         prompt: fullPrompt,
+        // Same project, same seed. Two renders of the same room from different
+        // angles then share a starting point, so the materials the model
+        // invents stay closer to each other instead of re-rolling every time.
+        seed: seedFromProjectId(projectId),
         negative_prompt:
           'different room, different layout, rearranged furniture, added furniture, removed furniture, chandelier, ornate decor, cartoon, illustration, painting, sketch, low quality, blurry, warped walls, distorted geometry, extra rooms, watermark, text',
         num_inference_steps: 30,
