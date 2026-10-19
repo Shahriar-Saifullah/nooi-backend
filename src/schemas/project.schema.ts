@@ -132,6 +132,10 @@ export const saveFurnitureSchema = z.object({
   wall_surfaces: z.record(z.string(), z.string().max(64)).optional(),
   // per-door finish: door key → finish id
   door_finishes: z.record(z.string(), z.string().max(64)).optional(),
+  // per-room floor finish: room id → surface id. Must be declared here —
+  // validate() replaces req.body with the parsed result, so any key missing
+  // from this schema is silently stripped before the controller sees it.
+  floor_surfaces: z.record(z.string(), z.string().max(64)).optional(),
 });
 
 // ── Sharing ──────────────────────────────────────────────────────────────────
