@@ -529,11 +529,16 @@ export async function saveFurniture(req: AuthRequest, res: Response) {
   try {
     const userId    = req.user!.id;
     const projectId = String(req.params.id);
-    const { furniture, wall_colors, wall_surfaces, door_finishes } = req.body as {
+    const {
+      furniture, wall_colors, wall_surfaces, door_finishes, floor_surfaces,
+    } = req.body as {
       furniture: unknown[];
       wall_colors?: Record<string, string>;
       wall_surfaces?: Record<string, string>;
       door_finishes?: Record<string, string>;
+      /** Per-room floor finish, keyed by ROOM id — unlike the wall maps,
+       *  which are keyed by wall face. */
+      floor_surfaces?: Record<string, string>;
     };
 
     const project = await verifyOwnership(projectId, userId);
@@ -548,9 +553,13 @@ export async function saveFurniture(req: AuthRequest, res: Response) {
         room_data: {
           ...existing,
           furniture,
+          // Each key is written only when the client sends it. A caller that
+          // saves furniture alone must not wipe the finishes, which is why
+          // these are spread conditionally rather than assigned.
           ...(wall_colors !== undefined ? { wall_colors } : {}),
           ...(wall_surfaces !== undefined ? { wall_surfaces } : {}),
           ...(door_finishes !== undefined ? { door_finishes } : {}),
+          ...(floor_surfaces !== undefined ? { floor_surfaces } : {}),
         },
         updated_at: new Date().toISOString(),
       })
@@ -563,6 +572,9 @@ export async function saveFurniture(req: AuthRequest, res: Response) {
     }
     return res.json({ success: true, data: { furniture } });
   } catch (err: any) {
+    // Was silent. A save that fails without a trace is the pattern that cost
+    // a day on the vendor routes.
+    console.error('Save furniture error:', err);
     return res.status(500).json({ success: false, error: err.message });
   }
 }
