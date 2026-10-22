@@ -122,6 +122,9 @@ export const furnitureItemSchema = z.object({
   width:          z.number().optional(),
   depth:          z.number().optional(),
   height:         z.number().optional(),
+  // Lamps only: 0 = off … 1 = full brightness. Listed here because validate()
+  // keeps ONLY the declared keys — an undeclared field is silently dropped.
+  lightLevel:     z.number().min(0).max(1).optional(),
 });
 
 export const saveFurnitureSchema = z.object({
