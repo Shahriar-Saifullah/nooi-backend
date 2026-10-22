@@ -830,7 +830,8 @@ interface GeminiImageResponse {
 
 export async function callGeminiImageModel(
   prompt: string,
-  referenceImage?: { data: string; mimeType: string } | null
+  referenceImage?: { data: string; mimeType: string } | null,
+  options: { model?: string; aspectRatio?: string } = {},
 ): Promise<{ base64: string; mimeType: string }> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set');
@@ -847,7 +848,7 @@ export async function callGeminiImageModel(
   // responseModalities is a newer capability and the REST contract is the
   // most stable reference for it — see ai.google.dev/gemini-api/docs/image-generation
   const response = await fetch(
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent',
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(options.model || 'gemini-2.5-flash-image')}:generateContent`,
     {
       method:  'POST',
       headers: {
@@ -856,7 +857,12 @@ export async function callGeminiImageModel(
       },
       body: JSON.stringify({
         contents: [{ role: 'user', parts: requestParts }],
-        generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
+        generationConfig: {
+          responseModalities: ['TEXT', 'IMAGE'],
+          // Without this the model may answer an edit in a different frame
+          // shape than the capture, which crops or pads the user's view.
+          ...(options.aspectRatio ? { imageConfig: { aspectRatio: options.aspectRatio } } : {}),
+        },
       }),
     }
   );
@@ -880,6 +886,43 @@ export async function callGeminiImageModel(
     base64:   imagePart.inlineData.data,
     mimeType: imagePart.inlineData.mimeType || 'image/png',
   };
+}
+
+/** Width/height from a base64 PNG or JPEG header, without decoding it. */
+function imageSizeFromBase64(b64: string): { w: number; h: number } | null {
+  const buf = Buffer.from(b64.slice(0, 200_000), 'base64');
+  // PNG: IHDR is always the first chunk
+  if (buf.length > 24 && buf.readUInt32BE(0) === 0x89504e47) {
+    return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+  }
+  // JPEG: walk the segments to the first start-of-frame marker
+  if (buf.length > 4 && buf[0] === 0xff && buf[1] === 0xd8) {
+    let i = 2;
+    while (i + 9 < buf.length) {
+      if (buf[i] !== 0xff) { i++; continue; }
+      const marker = buf[i + 1];
+      const len = buf.readUInt16BE(i + 2);
+      if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
+        return { h: buf.readUInt16BE(i + 5), w: buf.readUInt16BE(i + 7) };
+      }
+      i += 2 + len;
+    }
+  }
+  return null;
+}
+
+/** The Gemini-supported aspect ratio nearest to the capture's. */
+function closestAspectRatio(size: { w: number; h: number } | null): string | undefined {
+  if (!size || !size.w || !size.h) return undefined;
+  const options = ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'];
+  const target = Math.log(size.w / size.h);
+  let best = options[0], bestErr = Infinity;
+  for (const o of options) {
+    const [a, b] = o.split(':').map(Number);
+    const err = Math.abs(Math.log(a / b) - target);
+    if (err < bestErr) { bestErr = err; best = o; }
+  }
+  return best;
 }
 
 export async function generateRender(req: AuthRequest, res: Response) {
@@ -1340,7 +1383,7 @@ export async function renderScene(req: AuthRequest, res: Response) {
     }
 
     const token = process.env.REPLICATE_API_TOKEN || '';
-    if (!token) {
+    if (!token && !process.env.GEMINI_API_KEY) {
       return res.status(503).json({ success: false, error: 'Render engine not configured' });
     }
     if (!/^data:image\/(png|jpe?g|webp);base64,/.test(scene_image)) {
@@ -1395,100 +1438,169 @@ export async function renderScene(req: AuthRequest, res: Response) {
       return Math.abs(h) % 2_147_483_647;
     };
 
-    const useDepth = (process.env.RENDER_MODE || 'color') === 'depth' && !!depth_image;
+    const renderMode = (process.env.RENDER_MODE || 'gemini').toLowerCase();
 
-    const { default: Replicate } = await import('replicate');
-    const replicate = new Replicate({ auth: token });
-
-    let model: any;
-    let input: Record<string, unknown>;
-
-    if (useDepth) {
-      // A depth map carries no colour, so anything the user chose in 3D
-      // (wall paint, furniture finish) must be restated in words.
-      // A depth map carries no colour at all, so without this list the model
-      // invents every material — which is how a grey sofa comes back as brown
-      // leather with the geometry still correct.
-      const fullPrompt = [
-        'Photorealistic interior photograph of this exact room.',
-        'Follow the depth map precisely for room geometry, camera angle and furniture placement.',
-        roomContents,
-        'High-end architectural photography, natural window light, realistic materials, physically based textures, 8k detail.',
-        prompt ? `Style: ${prompt}` : 'Style: warm contemporary interior with natural materials.',
-      ].filter(Boolean).join(' ');
-
-      model = process.env.REPLICATE_DEPTH_MODEL || 'black-forest-labs/flux-depth-dev';
-      input = {
-        control_image: depth_image,
-        prompt: fullPrompt,
-        guidance: 10,
-        num_inference_steps: 28,
-        output_format: 'png',
-      };
-    } else {
-      // Contents go near the front: tokens early in a prompt carry more weight
-      // than tokens at the end, and this is the instruction that matters most.
-      const fullPrompt = [
-        'Photorealistic interior photograph of THIS room. Keep the existing room shape, camera angle, window and door positions, wall colours and every piece of furniture exactly where it is — same types, same sizes, same positions.',
-        roomContents,
-        'Only upgrade materials, textures and lighting to look real: high-end architectural photography, natural window light, physically based materials, 8k detail.',
-        'Do not add, remove, move or restyle furniture. Do not add chandeliers, curtains or decor that is not already present.',
-        prompt ? `Style request: ${prompt}` : '',
-      ].filter(Boolean).join(' ');
-
-      // How much the model may rewrite the capture. 0.8 (the old default)
-      // preserves only the coarse layout; 0.5–0.6 keeps furniture, colours and
-      // proportions much closer. Tune with RENDER_STRENGTH — no deploy needed.
-      // 0.55 redraws more than half the image, which is enough to turn a grey
-      // sectional into a brown leather armchair. 0.35 keeps furniture and
-      // colours recognisably the user's own. Still tunable without a deploy.
-      const strength = Number(process.env.RENDER_STRENGTH ?? 0.35);
-      const guidance = Number(process.env.RENDER_GUIDANCE ?? 12);
-
-      model = process.env.REPLICATE_RENDER_MODEL ||
-        'adirik/interior-design:76604baddc85b1b4616e1c6475eca080da339c8875bd4996705440484a6eac38';
-      input = {
-        image: scene_image,
-        prompt: fullPrompt,
-        // Same project, same seed. Two renders of the same room from different
-        // angles then share a starting point, so the materials the model
-        // invents stay closer to each other instead of re-rolling every time.
-        seed: seedFromProjectId(projectId),
-        negative_prompt:
-          'different room, different layout, rearranged furniture, added furniture, removed furniture, chandelier, ornate decor, cartoon, illustration, painting, sketch, low quality, blurry, warped walls, distorted geometry, extra rooms, watermark, text',
-        num_inference_steps: 30,
-        guidance_scale: Number.isFinite(guidance) ? guidance : 12,
-        prompt_strength: Number.isFinite(strength) ? Math.min(0.95, Math.max(0.2, strength)) : 0.55,
-      };
-    }
-
-    let output: any = null;
-    let lastErr: any = null;
-    for (let attempt = 0; attempt < 2 && output === null; attempt++) {
+    // ── Default: image EDITING with Gemini ───────────────────────────────────
+    // The Replicate paths below are diffusion img2img / depth-ControlNet: they
+    // repaint the frame from noise and only loosely follow it, which is why
+    // small, detailed furniture came back as a different object (a sectional
+    // sofa as a draped cloth or a grey blob). An editing model is built for
+    // the opposite job — change how the image looks, keep what is in it — so
+    // it preserves each piece of furniture whatever the catalogue holds.
+    //
+    // Model is an env var (GEMINI_RENDER_MODEL) so a newer Gemini image model
+    // can be tried without a deploy. If Gemini fails or refuses, the request
+    // falls through to the Replicate pipeline instead of failing the user.
+    let renderedBuffer: Buffer | null = null;
+    let renderedBy = '';
+    if (renderMode === 'gemini' && process.env.GEMINI_API_KEY) {
       try {
-        output = await replicate.run(model, { input });
-      } catch (e: any) {
-        lastErr = e;
-        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        const m = /^data:(image\/(?:png|jpe?g|webp));base64,(.+)$/.exec(scene_image);
+        if (!m) throw new Error('scene_image is not a base64 data URL');
+        const [, mimeType, data] = m;
+        const aspectRatio = closestAspectRatio(imageSizeFromBase64(data));
+
+        const editPrompt = [
+          'This image is a screenshot from a 3D interior design tool. Turn it into a photorealistic interior photograph of exactly the same scene.',
+          'Strict rules:',
+          '- Keep the camera position, angle, framing and perspective identical.',
+          '- Keep every piece of furniture and every object exactly as shown: same type, shape, proportions, colour, material, position and orientation. Do not add, remove, move, replace, merge or restyle anything.',
+          roomContents ? `- ${roomContents}` : '',
+          '- Keep the walls, floor, ceiling, doors and windows where they are, with the same colours and finishes. Keep the floor pattern at its real scale.',
+          '- Change only how real it looks: realistic materials and fabric texture, soft natural daylight from the windows, accurate soft shadows, contact shadows and reflections.',
+          '- No people, no text, no watermark.',
+          prompt ? `Mood or lighting request (this must not change any furniture): ${prompt}` : '',
+        ].filter(Boolean).join('\n');
+
+        // Tried in order. Google retires image model IDs often, so a missing
+        // or renamed model just moves on to the next instead of failing:
+        // GEMINI_RENDER_MODEL (if set), then Nano Banana 2.1 (current, about
+        // $0.034 per 1K image), then the older 2.5 Flash Image that the
+        // prompt-only render already uses.
+        const models = [...new Set([
+          process.env.GEMINI_RENDER_MODEL,
+          'gemini-nano-banana-2.1',
+          'gemini-2.5-flash-image',
+        ].filter((m): m is string => !!m))];
+        let lastGeminiErr: unknown = null;
+        for (const model of models) {
+          try {
+            const out = await callGeminiImageModel(editPrompt, { data, mimeType }, { model, aspectRatio });
+            renderedBuffer = Buffer.from(out.base64, 'base64');
+            renderedBy = `gemini:${model}`;
+            break;
+          } catch (e) {
+            lastGeminiErr = e;
+            console.warn(`Gemini render with ${model} failed:`, e instanceof Error ? e.message.slice(0, 300) : e);
+          }
+        }
+        if (!renderedBuffer) throw lastGeminiErr ?? new Error('no Gemini model produced an image');
+      } catch (e) {
+        console.error('Gemini scene render failed; falling back to Replicate:', e);
       }
     }
-    if (output === null) {
-      console.error('Replicate render error:', lastErr);
-      return res.status(502).json({ success: false, error: 'Render engine is busy — please try again.' });
-    }
 
-    // replicate-js may return a URL string, an array of them, or FileOutput objects
-    const first = Array.isArray(output) ? output[0] : output;
-    const outUrl =
-      typeof first === 'string' ? first
-      : typeof first?.url === 'function' ? String(first.url())
-      : String(first);
+    const useDepth = renderMode === 'depth' && !!depth_image;
 
-    const dl = await fetch(outUrl);
-    if (!dl.ok) {
-      return res.status(502).json({ success: false, error: 'Could not fetch rendered image' });
+    if (!renderedBuffer) {
+      if (!token) {
+        return res.status(502).json({ success: false, error: 'Render failed — please try again.' });
+      }
+      const { default: Replicate } = await import('replicate');
+      const replicate = new Replicate({ auth: token });
+
+      let model: any;
+      let input: Record<string, unknown>;
+
+      if (useDepth) {
+        // A depth map carries no colour, so anything the user chose in 3D
+        // (wall paint, furniture finish) must be restated in words.
+        // A depth map carries no colour at all, so without this list the model
+        // invents every material — which is how a grey sofa comes back as brown
+        // leather with the geometry still correct.
+        const fullPrompt = [
+          'Photorealistic interior photograph of this exact room.',
+          'Follow the depth map precisely for room geometry, camera angle and furniture placement.',
+          roomContents,
+          'High-end architectural photography, natural window light, realistic materials, physically based textures, 8k detail.',
+          prompt ? `Style: ${prompt}` : 'Style: warm contemporary interior with natural materials.',
+        ].filter(Boolean).join(' ');
+
+        model = process.env.REPLICATE_DEPTH_MODEL || 'black-forest-labs/flux-depth-dev';
+        input = {
+          control_image: depth_image,
+          prompt: fullPrompt,
+          guidance: 10,
+          num_inference_steps: 28,
+          output_format: 'png',
+        };
+      } else {
+        // Contents go near the front: tokens early in a prompt carry more weight
+        // than tokens at the end, and this is the instruction that matters most.
+        const fullPrompt = [
+          'Photorealistic interior photograph of THIS room. Keep the existing room shape, camera angle, window and door positions, wall colours and every piece of furniture exactly where it is — same types, same sizes, same positions.',
+          roomContents,
+          'Only upgrade materials, textures and lighting to look real: high-end architectural photography, natural window light, physically based materials, 8k detail.',
+          'Do not add, remove, move or restyle furniture. Do not add chandeliers, curtains or decor that is not already present.',
+          prompt ? `Style request: ${prompt}` : '',
+        ].filter(Boolean).join(' ');
+
+        // How much the model may rewrite the capture. 0.8 (the old default)
+        // preserves only the coarse layout; 0.5–0.6 keeps furniture, colours and
+        // proportions much closer. Tune with RENDER_STRENGTH — no deploy needed.
+        // 0.55 redraws more than half the image, which is enough to turn a grey
+        // sectional into a brown leather armchair. 0.35 keeps furniture and
+        // colours recognisably the user's own. Still tunable without a deploy.
+        const strength = Number(process.env.RENDER_STRENGTH ?? 0.35);
+        const guidance = Number(process.env.RENDER_GUIDANCE ?? 12);
+
+        model = process.env.REPLICATE_RENDER_MODEL ||
+          'adirik/interior-design:76604baddc85b1b4616e1c6475eca080da339c8875bd4996705440484a6eac38';
+        input = {
+          image: scene_image,
+          prompt: fullPrompt,
+          // Same project, same seed. Two renders of the same room from different
+          // angles then share a starting point, so the materials the model
+          // invents stay closer to each other instead of re-rolling every time.
+          seed: seedFromProjectId(projectId),
+          negative_prompt:
+            'different room, different layout, rearranged furniture, added furniture, removed furniture, chandelier, ornate decor, cartoon, illustration, painting, sketch, low quality, blurry, warped walls, distorted geometry, extra rooms, watermark, text',
+          num_inference_steps: 30,
+          guidance_scale: Number.isFinite(guidance) ? guidance : 12,
+          prompt_strength: Number.isFinite(strength) ? Math.min(0.95, Math.max(0.2, strength)) : 0.55,
+        };
+      }
+
+      let output: any = null;
+      let lastErr: any = null;
+      for (let attempt = 0; attempt < 2 && output === null; attempt++) {
+        try {
+          output = await replicate.run(model, { input });
+        } catch (e: any) {
+          lastErr = e;
+          await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        }
+      }
+      if (output === null) {
+        console.error('Replicate render error:', lastErr);
+        return res.status(502).json({ success: false, error: 'Render engine is busy — please try again.' });
+      }
+
+      // replicate-js may return a URL string, an array of them, or FileOutput objects
+      const first = Array.isArray(output) ? output[0] : output;
+      const outUrl =
+        typeof first === 'string' ? first
+        : typeof first?.url === 'function' ? String(first.url())
+        : String(first);
+
+      const dl = await fetch(outUrl);
+      if (!dl.ok) {
+        return res.status(502).json({ success: false, error: 'Could not fetch rendered image' });
+      }
+      renderedBuffer = Buffer.from(await dl.arrayBuffer());
+      renderedBy = useDepth ? 'replicate-flux-depth' : 'replicate-interior';
     }
-    const buffer = Buffer.from(await dl.arrayBuffer());
+    const buffer = renderedBuffer;
 
     // Persist to the same bucket/convention as generateRender, so scene renders
     // get stable URLs and show up in Recent Creations alongside prompt renders.
@@ -1504,7 +1616,7 @@ export async function renderScene(req: AuthRequest, res: Response) {
       .getPublicUrl(storagePath);
 
     saveGeneration(userId, projectId, prompt || 'Scene render', publicUrl,
-      useDepth ? 'replicate-flux-depth' : 'replicate-interior', 'scene-render');
+      renderedBy, 'scene-render');
 
     return res.status(200).json({ success: true, data: { image_url: publicUrl } });
   } catch (err) {
