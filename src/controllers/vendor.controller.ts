@@ -1,6 +1,9 @@
 import { Response } from 'express';
 import { supabase } from '../services/supabase';
 import { AuthRequest } from '../types';
+import { releaseEarnings } from '../services/payments/earnings.service';
+import { fromMinor, maskIban, normaliseSaudiIban, summarise } from '../services/payments/ledger';
+import { payoutHoldDays } from '../services/payments';
 import { UpdateVendorProfileInput } from '../schemas/auth.schema';
 
 export async function getVendorProfile(req: AuthRequest, res: Response) {
@@ -536,6 +539,9 @@ export async function advanceShipmentStatus(req: AuthRequest, res: Response) {
         .not('item_status', 'in', '("returned","cancelled")');
     }
 
+    // Delivered + approved order = the vendor's share becomes payable.
+    if (target === 'delivered') await releaseEarnings(current.order_id);
+
     await supabase.from('order_tracking_events').insert({
       shipment_id: shipmentId,
       status: target,
@@ -550,6 +556,145 @@ export async function advanceShipmentStatus(req: AuthRequest, res: Response) {
     });
   } catch (err) {
     console.error('advanceShipmentStatus error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+// ════════════════════════════════════════════════════════════════════════════
+// Earnings and payouts
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * router.get('/payments', requireVendor, getVendorPayments)
+ * Balance, the ledger lines (most recent first) and payout history.
+ * Amounts in SAR; the ledger itself is in halalas.
+ */
+export async function getVendorPayments(req: AuthRequest, res: Response) {
+  try {
+    const vendorId = req.user!.id;
+    await releaseEarnings();
+
+    const [{ data: rows, error }, { data: payouts }, { data: acct }, { data: rates }] = await Promise.all([
+      supabase.from('vendor_earnings')
+        .select('id, order_id, order_item_id, kind, gross_minor, commission_rate, commission_minor, net_minor, status, payout_id, created_at, payable_at, paid_at, note, orders ( order_number, approved_at )')
+        .eq('vendor_id', vendorId)
+        .order('created_at', { ascending: false })
+        .limit(500),
+      supabase.from('vendor_payouts')
+        .select('id, amount_minor, currency, status, sequence_number, channel, failure_reason, created_at, paid_at, destination')
+        .eq('vendor_id', vendorId)
+        .order('created_at', { ascending: false })
+        .limit(50),
+      supabase.from('vendor_payout_accounts').select('*').eq('vendor_id', vendorId).maybeSingle(),
+      supabase.from('retailers').select('name, commission_rate').eq('vendor_id', vendorId),
+    ]);
+    if (error) return res.status(400).json({ success: false, error: error.message });
+
+    const sum = summarise((rows || []) as any);
+    const lines = (rows || []).map((r: any) => ({
+      id: r.id,
+      order_id: r.order_id,
+      order_number: r.orders?.order_number ?? null,
+      kind: r.kind,
+      gross: fromMinor(Number(r.gross_minor)),
+      commission_rate: Number(r.commission_rate),
+      commission: fromMinor(Number(r.commission_minor)),
+      net: fromMinor(Number(r.net_minor)),
+      status: r.status,
+      // Why a pending line is not payable yet — the question vendors ask.
+      waiting_for: r.status !== 'pending' ? null
+        : !r.orders?.approved_at ? 'approval' : 'delivery',
+      created_at: r.created_at,
+      payable_at: r.payable_at,
+      paid_at: r.paid_at,
+      note: r.note,
+    }));
+
+    return res.json({
+      success: true,
+      data: {
+        currency: 'SAR',
+        hold_days: payoutHoldDays(),
+        balance: {
+          pending: fromMinor(sum.pending_minor),
+          payable: fromMinor(sum.payable_minor),
+          in_payout: fromMinor(sum.in_payout_minor),
+          paid: fromMinor(sum.paid_minor),
+          gross_sales: fromMinor(sum.gross_minor),
+          commission: fromMinor(sum.commission_minor),
+        },
+        commission_rates: rates || [],
+        account: acct ? {
+          account_holder: acct.account_holder, iban_masked: maskIban(acct.iban), bank_name: acct.bank_name,
+          city: acct.city, mobile: acct.mobile, verified: Boolean(acct.verified_at),
+        } : null,
+        lines,
+        payouts: (payouts || []).map((p: any) => ({
+          ...p, amount: fromMinor(Number(p.amount_minor)),
+          destination: { name: p.destination?.name, iban: maskIban(p.destination?.iban || '') },
+        })),
+      },
+    });
+  } catch (err) {
+    console.error('getVendorPayments error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+/** router.get('/payout-account', requireVendor, getVendorPayoutAccount) */
+export async function getVendorPayoutAccount(req: AuthRequest, res: Response) {
+  const { data } = await supabase.from('vendor_payout_accounts').select('*').eq('vendor_id', req.user!.id).maybeSingle();
+  return res.json({
+    success: true,
+    data: { account: data ? {
+      account_holder: data.account_holder, iban_masked: maskIban(data.iban), bank_name: data.bank_name,
+      mobile: data.mobile, city: data.city, verified: Boolean(data.verified_at), updated_at: data.updated_at,
+    } : null },
+  });
+}
+
+/**
+ * router.put('/payout-account', requireVendor, saveVendorPayoutAccount)
+ * body: { account_holder, iban, bank_name?, mobile, city }
+ *
+ * Changing the IBAN or holder clears verification: payouts stop until an
+ * admin re-checks it. That is the guard against a stolen vendor login
+ * redirecting money.
+ */
+export async function saveVendorPayoutAccount(req: AuthRequest, res: Response) {
+  try {
+    const vendorId = req.user!.id;
+    const b = req.body || {};
+    const iban = normaliseSaudiIban(b.iban);
+    const holder = String(b.account_holder || '').trim().slice(0, 140);
+    const mobile = String(b.mobile || '').replace(/[\s-]/g, '').slice(0, 20);
+    const city = String(b.city || '').trim().slice(0, 80);
+    const bank = String(b.bank_name || '').trim().slice(0, 80) || null;
+
+    if (!iban) return res.status(400).json({ success: false, error: 'Enter a valid Saudi IBAN (SA followed by 22 digits).' });
+    if (holder.length < 2) return res.status(400).json({ success: false, error: 'Enter the account holder name exactly as the bank has it.' });
+    if (!/^\+?\d{9,15}$/.test(mobile)) return res.status(400).json({ success: false, error: 'Enter a mobile number, e.g. +9665XXXXXXXX.' });
+    if (!city) return res.status(400).json({ success: false, error: 'Enter the city of the bank account.' });
+
+    const { data: prev } = await supabase.from('vendor_payout_accounts').select('*').eq('vendor_id', vendorId).maybeSingle();
+    const sameAccount = Boolean(prev && prev.iban === iban && prev.account_holder === holder);
+    const now = new Date().toISOString();
+    const row = {
+      vendor_id: vendorId, account_holder: holder, iban, bank_name: bank, mobile, city, country: 'SA',
+      verified_at: sameAccount ? prev!.verified_at : null,
+      verified_by: sameAccount ? prev!.verified_by : null,
+      updated_at: now,
+    };
+    const { error } = await supabase.from('vendor_payout_accounts').upsert(row, { onConflict: 'vendor_id' });
+    if (error) return res.status(400).json({ success: false, error: error.message });
+    await supabase.from('vendor_profiles').update({ payout_connected: Boolean(row.verified_at) }).eq('id', vendorId);
+
+    return res.json({
+      success: true,
+      data: { account: { account_holder: holder, iban_masked: maskIban(iban), bank_name: bank, mobile, city, verified: Boolean(row.verified_at) } },
+      message: row.verified_at ? 'Saved' : 'Saved. Nooi will verify this account before your next payout.',
+    });
+  } catch (err) {
+    console.error('saveVendorPayoutAccount error:', err);
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }

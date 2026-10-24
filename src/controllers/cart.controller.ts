@@ -1,4 +1,5 @@
 ﻿import { Request, Response } from 'express';
+import { checkoutCurrency } from '../services/payments';
 import { supabase } from '../services/supabase';
 import { calculateShipping } from '../services/shipping.service';
 import { calculateTax } from '../services/tax.service';
@@ -136,7 +137,7 @@ export const quoteCart = async (req: Request, res: Response) => {
       return res.json({
         success: true,
         groups: [], item_count: 0, subtotal: 0, shipping_total: 0,
-        tax_total: 0, discount_amount: 0, grand_total: 0, currency: 'USD',
+        tax_total: 0, discount_amount: 0, grand_total: 0, currency: checkoutCurrency(),
         promotion: null,
       });
     }
@@ -220,7 +221,7 @@ export const quoteCart = async (req: Request, res: Response) => {
       const shipping = calculateShipping(
         { id: group.retailer_id, name: group.retailer_name, shipping_policy_json: group._policy },
         group.subtotal,
-        'USD',
+        checkoutCurrency(),
         group.lead_time_days || null,
       );
       const tax = calculateTax(group.items, group.subtotal, shipping.shipping_amount);
@@ -254,7 +255,7 @@ export const quoteCart = async (req: Request, res: Response) => {
       promotion,
       promo_error: promoError,
       grand_total: grandTotal,
-      currency: 'USD',
+      currency: checkoutCurrency(),
     });
   } catch (err: any) {
     console.error('[cart] quote threw:', err);

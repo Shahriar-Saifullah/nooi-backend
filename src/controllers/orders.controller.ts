@@ -7,6 +7,10 @@ import { calculateCheckout, CheckoutError } from '../services/checkout.service';
 import { consumePromotion } from '../services/promotion.service';
 import { createPaymentIntentSchema } from '../schemas/checkout.schema';
 import { AuthRequest } from '../types';
+import { Provider, checkoutCurrency } from '../services/payments';
+import { moyasar, MoyasarError } from '../services/payments/moyasar';
+import { syncPayoutByProviderId } from '../services/payments/payouts.service';
+import { recordOrderEarnings } from '../services/payments/earnings.service';
 
 export const createPaymentIntent = async (req: Request, res: Response) => {
   try {
@@ -245,6 +249,18 @@ export const stripeWebhookHandler = async (req: Request, res: Response) => {
   }
 };
 
+/**
+ * A payment the gateway says succeeded, in a shape both gateways share.
+ * `refund` gives the whole payment back (used when the order cannot stand).
+ */
+interface PaidPayment {
+  provider: Provider;
+  id: string;
+  amountMinor: number;
+  currency: string;
+  refund: (metadata: Record<string, string>) => Promise<{ id: string }>;
+}
+
 async function handlePaymentIntentSucceeded(pi: any) {
   // Check if order already exists for this payment intent (idempotency)
   const { data: existingOrder } = await supabase
@@ -269,58 +285,57 @@ async function handlePaymentIntentSucceeded(pi: any) {
     return;
   }
 
+  await fulfilPaidCheckout(attempt, {
+    provider: 'stripe',
+    id: pi.id,
+    amountMinor: pi.amount,
+    currency: pi.currency,
+    refund: (metadata) => stripe.refunds.create({ payment_intent: pi.id, metadata }),
+  });
+}
+
+/**
+ * Turn a paid checkout attempt into an order — whichever gateway took the
+ * money. Every check that fails refunds the payment in full and records why.
+ * Returns the order id, or null when the payment was refunded instead.
+ */
+async function fulfilPaidCheckout(attempt: any, paid: PaidPayment): Promise<string | null> {
   if (attempt.status === 'completed') {
-    return;
+    const { data: order } = await supabase
+      .from('orders').select('id').eq('payment_intent_id', paid.id).maybeSingle();
+    return order?.id ?? null;
   }
 
-  // 1. Currency Check
-  if (pi.currency.toUpperCase() !== attempt.currency.toUpperCase()) {
-    console.error(`Currency mismatch for PI ${pi.id}: expected ${attempt.currency}, got ${pi.currency}`);
-    const refund = await stripe.refunds.create({
-      payment_intent: pi.id,
-      metadata: {
-        reason: 'currency_mismatch',
-        expected_currency: attempt.currency,
-        received_currency: pi.currency,
-      },
-    });
+  const fail = async (status: string, reason: string, metadata: Record<string, string>) => {
+    const refund = await paid.refund(metadata);
     await supabase
       .from('checkout_attempts')
       .update({
-        status: 'failed',
-        snapshot_json: {
-          ...attempt.snapshot_json,
-          failure_reason: 'currency_mismatch',
-          refund_id: refund.id,
-        },
+        status,
+        snapshot_json: { ...attempt.snapshot_json, failure_reason: reason, refund_id: refund.id },
       })
       .eq('id', attempt.id);
-    return;
+    return null;
+  };
+
+  // 1. Currency Check
+  if (paid.currency.toUpperCase() !== attempt.currency.toUpperCase()) {
+    console.error(`Currency mismatch for payment ${paid.id}: expected ${attempt.currency}, got ${paid.currency}`);
+    return fail('failed', 'currency_mismatch', {
+      reason: 'currency_mismatch',
+      expected_currency: attempt.currency,
+      received_currency: paid.currency,
+    });
   }
 
   // 2. Amount Validation against Snapshot
-  if (pi.amount !== Number(attempt.grand_total_cents)) {
-    console.error(`Amount mismatch for PI ${pi.id}: expected ${attempt.grand_total_cents}, got ${pi.amount}`);
-    const refund = await stripe.refunds.create({
-      payment_intent: pi.id,
-      metadata: {
-        reason: 'price_mismatch',
-        expected_amount: String(attempt.grand_total_cents),
-        received_amount: String(pi.amount),
-      },
+  if (paid.amountMinor !== Number(attempt.grand_total_cents)) {
+    console.error(`Amount mismatch for payment ${paid.id}: expected ${attempt.grand_total_cents}, got ${paid.amountMinor}`);
+    return fail('failed', 'price_mismatch', {
+      reason: 'price_mismatch',
+      expected_amount: String(attempt.grand_total_cents),
+      received_amount: String(paid.amountMinor),
     });
-    await supabase
-      .from('checkout_attempts')
-      .update({
-        status: 'failed',
-        snapshot_json: {
-          ...attempt.snapshot_json,
-          failure_reason: 'price_mismatch',
-          refund_id: refund.id,
-        },
-      })
-      .eq('id', attempt.id);
-    return;
   }
 
   const snapshot = attempt.snapshot_json;
@@ -342,25 +357,10 @@ async function handlePaymentIntentSucceeded(pi: any) {
 
       if (hasPriceMismatch) {
         console.warn(`Variant price changed after snapshot for attempt ${attempt.id}. Refunding.`);
-        const refund = await stripe.refunds.create({
-          payment_intent: pi.id,
-          metadata: {
-            reason: 'price_mismatch',
-            note: 'Underlying product variant price changed prior to fulfillment',
-          },
+        return fail('failed', 'price_mismatch', {
+          reason: 'price_mismatch',
+          note: 'Underlying product variant price changed prior to fulfillment',
         });
-        await supabase
-          .from('checkout_attempts')
-          .update({
-            status: 'failed',
-            snapshot_json: {
-              ...snapshot,
-              failure_reason: 'price_mismatch',
-              refund_id: refund.id,
-            },
-          })
-          .eq('id', attempt.id);
-        return;
       }
     }
   }
@@ -384,28 +384,13 @@ async function handlePaymentIntentSucceeded(pi: any) {
     p_tax_total: snapshot.tax_total,
     p_grand_total: snapshot.grand_total,
     p_currency: attempt.currency,
-    p_payment_intent_id: pi.id,
+    p_payment_intent_id: paid.id,
   });
 
   if (rpcError) {
     if (rpcError.message && rpcError.message.includes('STOCK_INSUFFICIENT')) {
       console.warn(`Stock insufficient during order creation for attempt ${attempt.id}. Issuing refund.`);
-      const refund = await stripe.refunds.create({
-        payment_intent: pi.id,
-        metadata: { reason: 'stock_insufficient' },
-      });
-
-      await supabase
-        .from('checkout_attempts')
-        .update({
-          status: 'stock_failed',
-          snapshot_json: {
-            ...snapshot,
-            failure_reason: 'stock_insufficient',
-            refund_id: refund.id,
-          },
-        })
-        .eq('id', attempt.id);
+      await fail('stock_failed', 'stock_insufficient', { reason: 'stock_insufficient' });
 
       await supabase.from('notifications').insert({
         user_id: attempt.user_id,
@@ -414,11 +399,24 @@ async function handlePaymentIntentSucceeded(pi: any) {
         type: 'order_status',
       });
 
-      return;
+      return null;
     }
 
-    // For other unexpected database errors, throw so webhook fails and Stripe retries
+    // For other unexpected database errors, throw so the webhook fails and the gateway retries
     throw rpcError;
+  }
+
+  // 4a. Which gateway took the money (create_order_atomic predates Moyasar
+  // and writes 'stripe'), so refunds later go back through the same one.
+  if (paid.provider !== 'stripe') {
+    const { error: provErr } = await supabase
+      .from('orders')
+      .update({ payment_provider: paid.provider, payment_method: paid.provider })
+      .eq('id', orderId);
+    if (provErr) {
+      // Refunds would be sent to the wrong gateway — fail so the delivery is retried.
+      throw provErr;
+    }
   }
 
   // 4b. Record the discount on the order, and consume the code.
@@ -441,7 +439,7 @@ async function handlePaymentIntentSucceeded(pi: any) {
 
     if (discountErr) {
       // The order is real and paid — a missing discount annotation is a
-      // reporting gap, not a reason to fail the webhook and have Stripe retry.
+      // reporting gap, not a reason to fail the webhook and have it retried.
       console.error('[checkout] could not record discount on order', {
         order_id: orderId,
         error: discountErr.message,
@@ -468,6 +466,18 @@ async function handlePaymentIntentSucceeded(pi: any) {
     }
   }
 
+  // 4c. What each vendor has earned on this order (pending until the order is
+  // approved and their shipment delivered). Never fails the order: a missing
+  // ledger row is repaired by re-running recordOrderEarnings.
+  try {
+    await recordOrderEarnings(orderId as unknown as string, snapshot, attempt.currency);
+  } catch (ledgerErr: any) {
+    console.error('[checkout] could not record vendor earnings — re-run for this order', {
+      order_id: orderId,
+      error: ledgerErr?.message,
+    });
+  }
+
   // 5. Mark attempt completed
   await supabase
     .from('checkout_attempts')
@@ -482,6 +492,8 @@ async function handlePaymentIntentSucceeded(pi: any) {
     type: 'order_status',
     link_url: `/orders/${orderId}`,
   });
+
+  return orderId as unknown as string;
 }
 
 async function handlePaymentIntentFailed(pi: any) {
@@ -807,5 +819,297 @@ export const submitReturnRequest = async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('submitReturnRequest error:', err);
     return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+// ════════════════════════════════════════════════════════════════════════════
+// Moyasar (Saudi Arabia)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The card form is Moyasar's own (Moyasar Form, in the browser), so card data
+// never touches Nooi. The flow:
+//
+//   1. POST /orders/moyasar/checkout   → a checkout attempt + the form config
+//   2. The form creates the payment. Its on_completed hook calls
+//      POST /orders/moyasar/bind       → we remember the payment id BEFORE the
+//                                        3-D Secure redirect, so a dropped
+//                                        connection cannot lose a paid order
+//   3. Moyasar redirects to /checkout/callback?id=… and the page calls
+//      POST /orders/moyasar/confirm    → we fetch the payment from Moyasar
+//                                        with the SECRET key and only then
+//                                        create the order
+//   4. POST /payments/moyasar/webhook  → the same, from Moyasar's side, in case
+//                                        the shopper closed the tab
+//
+// The browser's word is never taken for anything: status, amount and currency
+// are always read back from Moyasar's API.
+
+
+const MOYASAR_METHODS = (process.env.MOYASAR_METHODS || 'creditcard,stcpay')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+function moyasarFormConfig(attempt: { id: string; grand_total_cents: number; currency: string }, summary: any) {
+  const frontend = (process.env.FRONTEND_URL || '').split(',')[0].trim().replace(/\/$/, '');
+  const config: Record<string, any> = {
+    publishable_api_key: process.env.MOYASAR_PUBLISHABLE_KEY || '',
+    amount: Number(attempt.grand_total_cents),
+    currency: attempt.currency,
+    description: `Nooi order (${summary?.items?.length ?? 0} item${summary?.items?.length === 1 ? '' : 's'}) · ${attempt.id.slice(0, 8)}`,
+    callback_url: `${frontend}/checkout/callback`,
+    supported_networks: ['mada', 'visa', 'mastercard'],
+    methods: MOYASAR_METHODS,
+    metadata: { checkout_attempt_id: attempt.id },
+  };
+  if (MOYASAR_METHODS.includes('applepay')) {
+    config.apple_pay = {
+      country: 'SA',
+      label: process.env.MOYASAR_APPLE_PAY_LABEL || 'Nooi',
+      validate_merchant_url: 'https://api.moyasar.com/v1/applepay/initiate',
+    };
+  }
+  return config;
+}
+
+export const createMoyasarCheckout = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthRequest).user?.id;
+    if (!userId) return res.status(401).json({ success: false, error: 'Authentication required' });
+    if (!process.env.MOYASAR_PUBLISHABLE_KEY || !process.env.MOYASAR_SECRET_KEY) {
+      return res.status(503).json({ success: false, error: 'Payments are not configured yet.' });
+    }
+
+    const parsed = createPaymentIntentSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, error: 'Invalid checkout parameters', details: parsed.error.flatten() });
+    }
+    const promoCode =
+      typeof (req.body as any)?.promo_code === 'string'
+        ? (req.body as any).promo_code.trim().slice(0, 64) || null
+        : null;
+
+    const summary = await calculateCheckout(userId, parsed.data.shipping_address, checkoutCurrency(), promoCode);
+    if (summary.grand_total_cents < 100) {
+      return res.status(400).json({ success: false, error: 'The order total is below the minimum card payment (1 SAR).' });
+    }
+
+    // Same cart, still fresh, still unpaid: reuse it (the shopper refreshed).
+    const { data: existing } = await supabase
+      .from('checkout_attempts')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('cart_snapshot_hash', summary.cart_snapshot_hash)
+      .eq('status', 'active')
+      .maybeSingle();
+
+    if (existing && existing.payment_provider === 'moyasar'
+        && new Date(existing.expires_at).getTime() > Date.now()) {
+      return res.json({
+        success: true, provider: 'moyasar', checkout_attempt_id: existing.id,
+        summary: existing.snapshot_json, form: moyasarFormConfig(existing, existing.snapshot_json),
+      });
+    }
+
+    await supabase.from('checkout_attempts').update({ status: 'superseded' })
+      .eq('user_id', userId).eq('status', 'active');
+
+    const attempt = {
+      id: crypto.randomUUID(),
+      user_id: userId,
+      cart_snapshot_hash: summary.cart_snapshot_hash,
+      status: 'active',
+      snapshot_json: summary,
+      currency: summary.currency,
+      grand_total_cents: summary.grand_total_cents,
+      shipping_address: summary.shipping_address,
+      payment_provider: 'moyasar',
+    };
+    const { error: insertErr } = await supabase.from('checkout_attempts').insert(attempt);
+    if (insertErr) throw insertErr;
+
+    return res.json({
+      success: true, provider: 'moyasar', checkout_attempt_id: attempt.id,
+      summary, form: moyasarFormConfig(attempt, summary),
+    });
+  } catch (err: any) {
+    if (err instanceof CheckoutError) return res.status(err.status).json({ success: false, error: err.message });
+    console.error('createMoyasarCheckout error:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Failed to start checkout' });
+  }
+};
+
+const isUuid = (s: unknown): s is string =>
+  typeof s === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+
+/** Remember the Moyasar payment id on the attempt before the 3-D Secure hop. */
+export const bindMoyasarPayment = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthRequest).user?.id;
+    if (!userId) return res.status(401).json({ success: false, error: 'Authentication required' });
+    const { checkout_attempt_id, payment_id } = req.body || {};
+    if (!isUuid(checkout_attempt_id) || !isUuid(payment_id)) {
+      return res.status(400).json({ success: false, error: 'checkout_attempt_id and payment_id are required' });
+    }
+
+    const { data: attempt } = await supabase.from('checkout_attempts')
+      .select('id, user_id, status, payment_intent_id').eq('id', checkout_attempt_id).maybeSingle();
+    if (!attempt || attempt.user_id !== userId) return res.status(404).json({ success: false, error: 'Checkout not found' });
+    if (attempt.status !== 'active') return res.status(409).json({ success: false, error: `Checkout is ${attempt.status}` });
+
+    if (attempt.payment_intent_id && attempt.payment_intent_id !== payment_id) {
+      // An earlier try on this attempt. Only replace it if it did not go through.
+      const prev = await moyasar.getPayment(attempt.payment_intent_id).catch(() => null);
+      if (prev && (prev.status === 'paid' || prev.status === 'captured')) {
+        return res.status(409).json({ success: false, error: 'This checkout has already been paid.' });
+      }
+    }
+    await supabase.from('checkout_attempts').update({ payment_intent_id: payment_id }).eq('id', attempt.id);
+    return res.json({ success: true });
+  } catch (err: any) {
+    console.error('bindMoyasarPayment error:', err);
+    return res.status(500).json({ success: false, error: 'Could not record the payment' });
+  }
+};
+
+type MoyasarOutcome =
+  | { status: 'succeeded'; order_id: string }
+  | { status: 'processing' }
+  | { status: 'payment_failed'; message: string }
+  | { status: 'refunded'; message: string }
+  | { status: 'not_found' };
+
+/**
+ * Read a payment from Moyasar and, if it is paid, make sure it is an order.
+ * Shared by the callback page and the webhook; safe to run twice at once.
+ */
+async function processMoyasarPayment(paymentId: string, userId?: string): Promise<MoyasarOutcome> {
+  const { data: existingOrder } = await supabase.from('orders')
+    .select('id, user_id').eq('payment_intent_id', paymentId).maybeSingle();
+  if (existingOrder) {
+    if (userId && existingOrder.user_id !== userId) return { status: 'not_found' };
+    return { status: 'succeeded', order_id: existingOrder.id };
+  }
+
+  const payment = await moyasar.getPayment(paymentId);
+  const attemptId = payment.metadata?.checkout_attempt_id;
+
+  let attempt: any = null;
+  if (isUuid(attemptId)) {
+    ({ data: attempt } = await supabase.from('checkout_attempts').select('*').eq('id', attemptId).maybeSingle());
+  }
+  if (!attempt) {
+    ({ data: attempt } = await supabase.from('checkout_attempts').select('*').eq('payment_intent_id', paymentId).maybeSingle());
+  }
+  if (!attempt || attempt.payment_provider !== 'moyasar') return { status: 'not_found' };
+  if (userId && attempt.user_id !== userId) return { status: 'not_found' };
+
+  if (payment.status === 'initiated' || payment.status === 'authorized') return { status: 'processing' };
+  if (payment.status !== 'paid' && payment.status !== 'captured') {
+    return { status: 'payment_failed', message: payment.source?.message || 'The payment did not go through.' };
+  }
+
+  if (attempt.payment_intent_id !== paymentId) {
+    await supabase.from('checkout_attempts').update({ payment_intent_id: paymentId }).eq('id', attempt.id);
+    attempt.payment_intent_id = paymentId;
+  }
+
+  try {
+    const orderId = await fulfilPaidCheckout(attempt, {
+      provider: 'moyasar',
+      id: payment.id,
+      amountMinor: Number(payment.amount),
+      currency: payment.currency,
+      refund: async () => {
+        const r = await moyasar.refundPayment(payment.id);
+        return { id: `${payment.id}:refund:${r.refunded ?? payment.amount}` };
+      },
+    });
+    if (orderId) return { status: 'succeeded', order_id: orderId };
+    const { data: after } = await supabase.from('checkout_attempts')
+      .select('status, snapshot_json').eq('id', attempt.id).maybeSingle();
+    return {
+      status: 'refunded',
+      message: after?.status === 'stock_failed'
+        ? 'Something in your cart sold out while you were paying. You have been refunded in full.'
+        : 'Prices changed while you were paying, so the payment was refunded in full. Please check out again.',
+    };
+  } catch (err: any) {
+    // The other path (webhook vs callback) created the order a moment ago.
+    if (err?.code === '23505') {
+      const { data: order } = await supabase.from('orders').select('id').eq('payment_intent_id', paymentId).maybeSingle();
+      if (order) return { status: 'succeeded', order_id: order.id };
+    }
+    throw err;
+  }
+}
+
+/** The callback page: /checkout/callback?id=<payment id> */
+export const confirmMoyasarPayment = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthRequest).user?.id;
+    if (!userId) return res.status(401).json({ success: false, error: 'Authentication required' });
+    const paymentId = req.body?.payment_id;
+    if (!isUuid(paymentId)) return res.status(400).json({ success: false, error: 'payment_id is required' });
+
+    const outcome = await processMoyasarPayment(paymentId, userId);
+    if (outcome.status === 'not_found') return res.status(404).json({ success: false, error: 'Payment not found' });
+    return res.json({ success: true, ...outcome });
+  } catch (err: any) {
+    if (err instanceof MoyasarError && err.status === 404) {
+      return res.status(404).json({ success: false, error: 'Payment not found' });
+    }
+    console.error('confirmMoyasarPayment error:', err);
+    return res.status(500).json({ success: false, error: 'Could not confirm the payment. If you were charged, your order will appear shortly.' });
+  }
+};
+
+function tokensMatch(a: string, b: string) {
+  const x = Buffer.from(a), y = Buffer.from(b);
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+/**
+ * Moyasar webhooks. Authenticated by the shared secret_token in the body.
+ * The body is only a hint: every payment and payout is re-read from the API.
+ */
+export const moyasarWebhookHandler = async (req: Request, res: Response) => {
+  const secret = process.env.MOYASAR_WEBHOOK_SECRET;
+  const event = req.body || {};
+  if (!secret || typeof event.secret_token !== 'string' || !tokensMatch(event.secret_token, secret)) {
+    return res.status(401).json({ error: 'invalid token' });
+  }
+  if (typeof event.id !== 'string' || typeof event.type !== 'string') {
+    return res.status(400).json({ error: 'malformed event' });
+  }
+
+  const eventKey = `moyasar:${event.id}`;
+  const { data: seen } = await supabase.from('webhook_events').select('*').eq('stripe_event_id', eventKey).maybeSingle();
+  if (seen?.status === 'completed') return res.status(200).json({ received: true, already_processed: true });
+  if (!seen) {
+    await supabase.from('webhook_events').insert({
+      stripe_event_id: eventKey, event_type: event.type, status: 'processing', attempts: 1,
+    });
+  } else {
+    await supabase.from('webhook_events').update({ status: 'processing', attempts: (seen.attempts || 1) + 1 })
+      .eq('id', seen.id);
+  }
+
+  try {
+    const dataId = event.data?.id;
+    if (event.type.startsWith('payout') && typeof dataId === 'string') {
+      await syncPayoutByProviderId(dataId);
+    } else if ((event.type === 'payment_paid' || event.type === 'payment_captured') && isUuid(dataId)) {
+      await processMoyasarPayment(dataId);
+    }
+    // payment_failed ('payment_faild' in Moyasar's docs), refunded, voided:
+    // nothing to do — refunds are initiated here and already recorded.
+
+    await supabase.from('webhook_events').update({
+      status: 'completed', result: 'success', processed_at: new Date().toISOString(),
+    }).eq('stripe_event_id', eventKey);
+    return res.status(200).json({ received: true });
+  } catch (err: any) {
+    console.error(`Moyasar webhook ${event.id} failed:`, err);
+    await supabase.from('webhook_events').update({ status: 'failed', error_message: err?.message || 'failed' })
+      .eq('stripe_event_id', eventKey);
+    return res.status(500).json({ error: 'processing failed, retryable' });
   }
 };

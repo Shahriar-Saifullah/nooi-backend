@@ -1,5 +1,10 @@
 import { Response } from 'express';
-import { stripe } from '../services/stripe';
+import { refundOrderPayment, money, payoutHoldDays } from '../services/payments';
+import { reverseEarnings, releaseEarnings } from '../services/payments/earnings.service';
+import {
+  createVendorPayout, syncOpenPayouts, syncPayout, sendPayout, PayoutError,
+} from '../services/payments/payouts.service';
+import { fromMinor, maskIban, summarise } from '../services/payments/ledger';
 import { supabase } from '../services/supabase';
 import { AuthRequest } from '../types';
 import {
@@ -1710,7 +1715,7 @@ export async function refundReturn(req: AuthRequest, res: Response) {
 
     const { data: order } = await supabase
       .from('orders')
-      .select('id, order_number, payment_intent_id')
+      .select('id, order_number, payment_intent_id, payment_provider, currency')
       .eq('id', ret.order_id)
       .maybeSingle();
 
@@ -1749,18 +1754,17 @@ export async function refundReturn(req: AuthRequest, res: Response) {
     //    Stripe returns the original refund rather than making a second one.
     let refundId: string;
     try {
-      const refund = await stripe.refunds.create(
-        {
-          payment_intent: order.payment_intent_id,
-          amount: Math.round(amount * 100),
-          metadata: {
-            return_id: id,
-            order_number: order.order_number ?? '',
-            order_item_id: ret.order_item_id ?? '',
-          },
+      const refund = await refundOrderPayment({
+        provider: order.payment_provider,
+        paymentId: order.payment_intent_id,
+        amountMinor: Math.round(amount * 100),
+        key: `return-refund-${id}`,
+        metadata: {
+          return_id: id,
+          order_number: order.order_number ?? '',
+          order_item_id: ret.order_item_id ?? '',
         },
-        { idempotencyKey: `return-refund-${id}` },
-      );
+      });
       refundId = refund.id;
     } catch (stripeErr: any) {
       // 3a. Release. Nobody was refunded, so the request is as valid as before.
@@ -1799,20 +1803,23 @@ export async function refundReturn(req: AuthRequest, res: Response) {
       });
     }
 
+    // The vendor does not keep money the customer got back.
+    await reverseEarnings(ret.order_id, ret.order_item_id, `Return refunded (${refundId})`);
+
     await supabase.from('admin_audit_log').insert({
       actor_id: adminId,
       actor_email: req.user?.email || null,
       action: 'refund.issued',
       entity_type: 'order_return',
       entity_id: id,
-      summary: `Refunded $${amount.toFixed(2)} on ${order.order_number}`,
+      summary: `Refunded ${money(amount, order.currency)} on ${order.order_number}`,
       metadata: { amount, refund_id: refundId, order_id: ret.order_id },
     });
 
     await supabase.from('notifications').insert({
       user_id: (await supabase.from('order_returns').select('user_id').eq('id', id).maybeSingle()).data?.user_id,
       title: 'Your refund is on its way',
-      message: `We've refunded $${amount.toFixed(2)} for your return on ${order.order_number}. It usually reaches your account within five working days.`,
+      message: `We've refunded ${money(amount, order.currency)} for your return on ${order.order_number}. It usually reaches your account within five working days.`,
       type: 'return',
     });
 
@@ -1820,7 +1827,7 @@ export async function refundReturn(req: AuthRequest, res: Response) {
     return res.status(200).json({
       success: true,
       data: { status: row?.final_status ?? 'refunded', refund_id: refundId, amount },
-      message: `Refunded $${amount.toFixed(2)}`,
+      message: `Refunded ${money(amount, order.currency)}`,
     });
   } catch (err) {
     console.error('refundReturn error:', err);
@@ -1926,8 +1933,8 @@ export async function searchOrders(req: AuthRequest, res: Response) {
     let query = supabase
       .from('orders')
       .select(`
-        id, order_number, status, total_amount, created_at, shipping_address,
-        payment_intent_id, intervened_at
+        id, order_number, status, total_amount, currency, created_at, shipping_address,
+        payment_intent_id, payment_provider, approved_at, intervened_at
       `)
       .order('created_at', { ascending: false })
       .limit(25);
@@ -2029,6 +2036,13 @@ export async function getOrderForIntervention(req: AuthRequest, res: Response) {
 
     const refunded = (returns || []).filter((r: any) => r.status === 'refunded');
 
+    // What each vendor earns on this order, and whether it is payable yet.
+    const { data: earnings } = await supabase
+      .from('vendor_earnings')
+      .select('id, vendor_id, retailer_id, kind, gross_minor, commission_rate, commission_minor, net_minor, status, payout_id, payable_at, paid_at')
+      .eq('order_id', id)
+      .order('created_at', { ascending: true });
+
     return res.status(200).json({
       success: true,
       data: {
@@ -2038,6 +2052,7 @@ export async function getOrderForIntervention(req: AuthRequest, res: Response) {
         },
         interventions: interventions || [],
         returns: returns || [],
+        earnings: earnings || [],
         already_refunded_count: refunded.length,
         // The client uses this to decide whether to offer Cancel at all.
         viewer_can_cancel: req.userProfile?.role === 'super_admin',
@@ -2133,7 +2148,7 @@ export async function cancelOrderAsAdmin(req: AuthRequest, res: Response) {
   try {
     const { data: order } = await supabase
       .from('orders')
-      .select('id, order_number, payment_intent_id, user_id, status')
+      .select('id, order_number, payment_intent_id, payment_provider, currency, user_id, status')
       .eq('id', id)
       .maybeSingle();
 
@@ -2175,14 +2190,13 @@ export async function cancelOrderAsAdmin(req: AuthRequest, res: Response) {
     let refundId: string | null = null;
     if (amount > 0 && order.payment_intent_id) {
       try {
-        const refund = await stripe.refunds.create(
-          {
-            payment_intent: order.payment_intent_id,
-            amount: Math.round(amount * 100),
-            metadata: { order_id: id, order_number: order.order_number ?? '', reason: note.slice(0, 200) },
-          },
-          { idempotencyKey: `order-cancel-${id}` },
-        );
+        const refund = await refundOrderPayment({
+          provider: order.payment_provider,
+          paymentId: order.payment_intent_id,
+          amountMinor: Math.round(amount * 100),
+          key: `order-cancel-${id}`,
+          metadata: { order_id: id, order_number: order.order_number ?? '', reason: note.slice(0, 200) },
+        });
         refundId = refund.id;
       } catch (stripeErr: any) {
         await supabase.rpc('settle_order_cancellation', {
@@ -2219,13 +2233,15 @@ export async function cancelOrderAsAdmin(req: AuthRequest, res: Response) {
       });
     }
 
+    await reverseEarnings(id, null, `Order cancelled: ${note}`);
+
     await supabase.from('admin_audit_log').insert({
       actor_id: adminId,
       actor_email: req.user?.email || null,
       action: 'order.cancelled',
       entity_type: 'order',
       entity_id: id,
-      summary: `Cancelled ${order.order_number}${amount > 0 ? ` and refunded $${amount.toFixed(2)}` : ''}: ${note.slice(0, 140)}`,
+      summary: `Cancelled ${order.order_number}${amount > 0 ? ` and refunded ${money(amount, order.currency)}` : ''}: ${note.slice(0, 140)}`,
       metadata: { note, refund_amount: amount, refund_id: refundId },
     });
 
@@ -2234,7 +2250,7 @@ export async function cancelOrderAsAdmin(req: AuthRequest, res: Response) {
         user_id: order.user_id,
         title: `Order ${order.order_number} has been cancelled`,
         message: amount > 0
-          ? `${note}\n\nWe've refunded $${amount.toFixed(2)}. It usually reaches your account within five working days.`
+          ? `${note}\n\nWe've refunded ${money(amount, order.currency)}. It usually reaches your account within five working days.`
           : note,
         type: 'order_status',
       });
@@ -2244,10 +2260,241 @@ export async function cancelOrderAsAdmin(req: AuthRequest, res: Response) {
     return res.status(200).json({
       success: true,
       data: { status: row?.final_status ?? 'cancelled', refund_id: refundId, refunded: amount },
-      message: amount > 0 ? `Cancelled and refunded $${amount.toFixed(2)}` : 'Order cancelled',
+      message: amount > 0 ? `Cancelled and refunded ${money(amount, order.currency)}` : 'Order cancelled',
     });
   } catch (err) {
     console.error('cancelOrderAsAdmin error:', err);
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
+}
+// ════════════════════════════════════════════════════════════════════════════
+// Payments: order approval, Nooi's balance, vendor payouts
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Money arrives in Nooi's Moyasar account when the customer pays. Each vendor's
+// share is recorded in vendor_earnings as 'pending'. It becomes payable when
+// an admin approves the order AND that vendor's shipment is delivered; a payout
+// sends everything payable to the vendor's verified IBAN.
+
+
+async function audit(req: AuthRequest, action: string, entityType: string, entityId: string, summary: string, metadata: any = {}) {
+  await supabase.from('admin_audit_log').insert({
+    actor_id: req.user?.id,
+    actor_email: req.user?.email || null,
+    action, entity_type: entityType, entity_id: entityId, summary, metadata,
+  });
+}
+
+/** router.post('/orders/:id/approve', requireAdmin, approveOrder) */
+export async function approveOrder(req: AuthRequest, res: Response) {
+  const id = req.params.id as string;
+  const adminId = req.user?.id;
+  if (!adminId) return res.status(401).json({ success: false, error: 'Authentication required' });
+  try {
+    const { data, error } = await supabase.rpc('approve_order', {
+      p_order_id: id, p_admin_id: adminId, p_hold_days: payoutHoldDays(),
+    });
+    if (error) return res.status(400).json({ success: false, error: error.message });
+    const row: any = Array.isArray(data) ? data[0] : data;
+    if (!row) return res.status(404).json({ success: false, error: 'Order not found' });
+    if (!row.applied) {
+      return res.status(409).json({
+        success: false,
+        error: row.approved_on ? 'This order is already approved.' : `A ${row.current_status} order cannot be approved.`,
+        data: { current_status: row.current_status, approved_at: row.approved_on },
+      });
+    }
+    const { data: order } = await supabase.from('orders').select('order_number').eq('id', id).maybeSingle();
+    await audit(req, 'order.approved', 'order', id, `Approved ${order?.order_number ?? id} for vendor payment`);
+    return res.json({ success: true, data: { approved_at: row.approved_on }, message: 'Order approved' });
+  } catch (err) {
+    console.error('approveOrder error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+/**
+ * router.get('/payments/overview', requireAdmin, getPaymentsOverview)
+ *
+ * Nooi's position: what customers paid, what has been refunded, what is owed
+ * to vendors (pending / payable / in flight), what has been paid out, and
+ * Nooi's commission. Plus one row per vendor with a balance.
+ */
+export async function getPaymentsOverview(req: AuthRequest, res: Response) {
+  try {
+    await releaseEarnings();
+    await syncOpenPayouts(5);
+
+    const [{ data: orders }, { data: earnings }, { data: accounts }, { data: payouts }] = await Promise.all([
+      supabase.from('orders').select('id, total_amount, tax_amount, currency, status, approved_at, payment_provider'),
+      supabase.from('vendor_earnings').select('vendor_id, kind, status, gross_minor, commission_minor, net_minor'),
+      supabase.from('vendor_payout_accounts').select('vendor_id, account_holder, iban, bank_name, city, verified_at'),
+      supabase.from('vendor_payouts').select('vendor_id, status, amount_minor, created_at').order('created_at', { ascending: false }),
+    ]);
+
+    const live = (orders || []).filter((o: any) => o.status !== 'cancelled');
+    const collected = (orders || []).reduce((a: number, o: any) => a + Number(o.total_amount || 0), 0);
+    const vat = live.reduce((a: number, o: any) => a + Number(o.tax_amount || 0), 0);
+    const awaitingApproval = live.filter((o: any) => !o.approved_at && o.status !== 'cancelling').length;
+
+    const byVendor = new Map<string, any[]>();
+    for (const e of earnings || []) {
+      const list = byVendor.get(e.vendor_id) || [];
+      list.push(e);
+      byVendor.set(e.vendor_id, list);
+    }
+    const vendorIds = [...new Set([...(byVendor.keys()), ...((accounts || []).map((a: any) => a.vendor_id))])];
+    const { data: profiles } = vendorIds.length
+      ? await supabase.from('vendor_profiles').select('id, business_name, store_name').in('id', vendorIds)
+      : { data: [] as any[] };
+    const nameOf = new Map((profiles || []).map((p: any) => [p.id, p.store_name || p.business_name]));
+    const acctOf = new Map((accounts || []).map((a: any) => [a.vendor_id, a]));
+    const lastPayoutOf = new Map<string, any>();
+    for (const p of payouts || []) if (!lastPayoutOf.has(p.vendor_id)) lastPayoutOf.set(p.vendor_id, p);
+
+    const vendors = vendorIds.map(vid => {
+      const sum = summarise((byVendor.get(vid) || []) as any);
+      const acct = acctOf.get(vid);
+      return {
+        vendor_id: vid,
+        name: nameOf.get(vid) ?? 'Unknown vendor',
+        pending: fromMinor(sum.pending_minor),
+        payable: fromMinor(sum.payable_minor),
+        in_payout: fromMinor(sum.in_payout_minor),
+        paid: fromMinor(sum.paid_minor),
+        commission: fromMinor(sum.commission_minor),
+        account: acct ? {
+          holder: acct.account_holder, iban_masked: maskIban(acct.iban), bank_name: acct.bank_name,
+          verified: Boolean(acct.verified_at),
+        } : null,
+        last_payout: lastPayoutOf.get(vid) ?? null,
+      };
+    }).sort((a, b) => b.payable - a.payable || a.name.localeCompare(b.name));
+
+    const all = summarise((earnings || []) as any);
+    return res.json({
+      success: true,
+      data: {
+        currency: 'SAR',
+        hold_days: payoutHoldDays(),
+        totals: {
+          collected: Number(collected.toFixed(2)),
+          vat_collected: Number(vat.toFixed(2)),
+          commission: fromMinor(all.commission_minor),
+          owed_pending: fromMinor(all.pending_minor),
+          owed_payable: fromMinor(all.payable_minor),
+          in_payout: fromMinor(all.in_payout_minor),
+          paid_out: fromMinor(all.paid_minor),
+          orders_awaiting_approval: awaitingApproval,
+        },
+        vendors,
+      },
+    });
+  } catch (err) {
+    console.error('getPaymentsOverview error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+/** router.get('/payouts', requireAdmin, listPayouts) — ?vendor_id= optional */
+export async function listPayouts(req: AuthRequest, res: Response) {
+  try {
+    await syncOpenPayouts(10);
+    let q = supabase.from('vendor_payouts')
+      .select('id, vendor_id, amount_minor, currency, status, channel, sequence_number, provider_payout_id, destination, earnings_count, failure_reason, last_error, created_at, paid_at')
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (typeof req.query.vendor_id === 'string') q = q.eq('vendor_id', req.query.vendor_id);
+    const { data, error } = await q;
+    if (error) return res.status(400).json({ success: false, error: error.message });
+    const payouts = (data || []).map((p: any) => ({
+      ...p,
+      amount: fromMinor(Number(p.amount_minor)),
+      destination: { ...p.destination, iban: maskIban(p.destination?.iban || '') },
+    }));
+    return res.json({ success: true, data: { payouts } });
+  } catch (err) {
+    console.error('listPayouts error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+/**
+ * router.post('/payouts', requireAdmin, createPayout)  body: { vendor_id }
+ * Sending money out is a super-admin action, like cancelling an order.
+ */
+export async function createPayout(req: AuthRequest, res: Response) {
+  const adminId = req.user?.id;
+  const vendorId = String(req.body?.vendor_id || '');
+  if (!adminId) return res.status(401).json({ success: false, error: 'Authentication required' });
+  if (req.userProfile?.role !== 'super_admin') {
+    return res.status(403).json({ success: false, error: 'Only a super administrator can send payouts.' });
+  }
+  if (!vendorId) return res.status(400).json({ success: false, error: 'vendor_id is required' });
+  try {
+    const payout: any = await createVendorPayout(vendorId, adminId);
+    const amount = fromMinor(Number(payout?.amount_minor || 0));
+    await audit(req, 'payout.created', 'vendor', vendorId,
+      `Payout of SAR ${amount.toFixed(2)} (${payout?.status})`, { payout_id: payout?.id, amount });
+    const ok = payout && !['failed', 'canceled', 'returned'].includes(payout.status);
+    return res.status(ok ? 200 : 502).json({
+      success: ok,
+      data: { payout: { ...payout, amount } },
+      ...(ok ? { message: payout.status === 'creating'
+          ? 'Payout saved but Moyasar did not confirm it yet — it will be retried.'
+          : `Payout of SAR ${amount.toFixed(2)} sent` }
+        : { error: payout?.failure_reason || 'Moyasar rejected the payout. The amount is payable again.' }),
+    });
+  } catch (err: any) {
+    if (err instanceof PayoutError) return res.status(err.status).json({ success: false, error: err.message });
+    console.error('createPayout error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+/** router.post('/payouts/:id/refresh', requireAdmin, refreshPayout) — re-check with Moyasar / retry sending */
+export async function refreshPayout(req: AuthRequest, res: Response) {
+  try {
+    const id = req.params.id as string;
+    const { data: before } = await supabase.from('vendor_payouts').select('status').eq('id', id).maybeSingle();
+    if (!before) return res.status(404).json({ success: false, error: 'Payout not found' });
+    if (before.status === 'creating' && req.userProfile?.role !== 'super_admin') {
+      return res.status(403).json({ success: false, error: 'Only a super administrator can re-send a payout.' });
+    }
+    const payout: any = before.status === 'creating' ? await sendPayout(id) : await syncPayout(id);
+    return res.json({ success: true, data: { payout: { ...payout, amount: fromMinor(Number(payout?.amount_minor || 0)) } } });
+  } catch (err: any) {
+    if (err instanceof PayoutError) return res.status(err.status).json({ success: false, error: err.message });
+    console.error('refreshPayout error:', err);
+    return res.status(502).json({ success: false, error: err?.message || 'Could not reach Moyasar' });
+  }
+}
+
+/** router.get('/vendors/:id/payout-account', requireAdmin, getVendorPayoutAccount) — full IBAN, for checking */
+export async function getVendorPayoutAccount(req: AuthRequest, res: Response) {
+  const { data } = await supabase.from('vendor_payout_accounts').select('*').eq('vendor_id', req.params.id as string).maybeSingle();
+  return res.json({ success: true, data: { account: data ?? null } });
+}
+
+/**
+ * router.post('/vendors/:id/payout-account/verify', requireAdmin, verifyVendorPayoutAccount)
+ * An admin has checked the IBAN belongs to the vendor's business (e.g. against
+ * the bank letter in their documents). Payouts are refused until then.
+ */
+export async function verifyVendorPayoutAccount(req: AuthRequest, res: Response) {
+  const vendorId = req.params.id as string;
+  const adminId = req.user?.id;
+  const { data: acct } = await supabase.from('vendor_payout_accounts').select('iban, updated_at').eq('vendor_id', vendorId).maybeSingle();
+  if (!acct) return res.status(404).json({ success: false, error: 'This vendor has not added a bank account.' });
+  // Only the version the admin looked at: if the vendor changed it since, refuse.
+  if (req.body?.iban && String(req.body.iban).replace(/\s/g, '').toUpperCase() !== acct.iban) {
+    return res.status(409).json({ success: false, error: 'The bank account changed while you were checking it. Reload and check again.' });
+  }
+  const now = new Date().toISOString();
+  const { error } = await supabase.from('vendor_payout_accounts')
+    .update({ verified_at: now, verified_by: adminId, updated_at: now }).eq('vendor_id', vendorId).eq('iban', acct.iban);
+  if (error) return res.status(400).json({ success: false, error: error.message });
+  await supabase.from('vendor_profiles').update({ payout_connected: true }).eq('id', vendorId);
+  await audit(req, 'vendor.payout_account_verified', 'vendor', vendorId, `Verified payout account ${maskIban(acct.iban)}`);
+  return res.json({ success: true, message: 'Bank account verified' });
 }

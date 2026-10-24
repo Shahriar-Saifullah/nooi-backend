@@ -123,10 +123,11 @@ describe('NOOI Phase 03 Stripe Checkout & Transaction Layer Verification Suite',
   });
 
   describe('2. Tax Service Baseline', () => {
-    it('returns zero tax for unconfigured provider interface', () => {
+    it('charges Saudi VAT at 15% on goods and shipping', () => {
       const res = calculateTax([], 200, 15);
-      expect(res.tax_amount).toBe(0);
-      expect(res.provider).toBe('unconfigured');
+      expect(res.tax_amount).toBe(32.25);
+      expect(res.provider).toBe('ksa_vat_15');
+      expect(calculateTax([], 0, 0).tax_amount).toBe(0);
     });
   });
 
@@ -172,8 +173,9 @@ describe('NOOI Phase 03 Stripe Checkout & Transaction Layer Verification Suite',
 
       expect(summary.subtotal).toBe(500.0);
       expect(summary.shipping_total).toBe(50.0);
-      expect(summary.grand_total).toBe(550.0);
-      expect(summary.grand_total_cents).toBe(55000);
+      expect(summary.tax_total).toBe(82.5);          // 15% VAT on 550
+      expect(summary.grand_total).toBe(632.5);
+      expect(summary.grand_total_cents).toBe(63250);
       expect(summary.cart_snapshot_hash).toBeDefined();
     });
 
@@ -900,7 +902,7 @@ describe('NOOI Phase 03 Stripe Checkout & Transaction Layer Verification Suite',
 
       // Verify a fresh PaymentIntent was created
       expect(stripe.paymentIntents.create).toHaveBeenCalledWith(
-        expect.objectContaining({ amount: 20000, currency: 'usd' }),
+        expect.objectContaining({ amount: 23000, currency: 'usd' }),   // 200 + 15% VAT
         expect.any(Object)
       );
 
