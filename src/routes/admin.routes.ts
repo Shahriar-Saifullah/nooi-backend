@@ -26,6 +26,13 @@ import {
   getOrderForIntervention,
   cancelOrderAsAdmin,
   searchOrders,
+  approveOrder,
+  getPaymentsOverview,
+  listPayouts,
+  createPayout,
+  refreshPayout,
+  getVendorPayoutAccount,
+  verifyVendorPayoutAccount,
 } from '../controllers/admin.controller';
 import { requireAdmin } from '../middleware/auth.middleware';
 import { validate } from '../middleware/validate';
@@ -50,6 +57,8 @@ router.get('/vendors/queue', requireAdmin, getVendorQueue);
 router.get('/vendors', requireAdmin, listVendors);
 router.get('/vendors/:id/documents/:kind', requireAdmin, getVendorDocumentUrl);
 router.get('/vendors/directory', requireAdmin, getVendorDirectory);
+router.get('/vendors/:id/payout-account', requireAdmin, getVendorPayoutAccount);
+router.post('/vendors/:id/payout-account/verify', requireAdmin, verifyVendorPayoutAccount);
 router.get('/vendors/:id', requireAdmin, getVendorById);
 router.get('/vendors/:id/review', requireAdmin, getVendorForReview);
 router.post('/vendors/:id/review/claim', requireAdmin, claimVendorReview);
@@ -78,5 +87,12 @@ router.get('/orders',               requireAdmin, searchOrders);
 router.get('/orders/:id',           requireAdmin, getOrderForIntervention);
 router.post('/orders/:id/override', requireAdmin, overrideOrderStatus);
 router.post('/orders/:id/cancel',   requireAdmin, cancelOrderAsAdmin);
+router.post('/orders/:id/approve',  requireAdmin, approveOrder);
+
+// Payments and vendor payouts
+router.get('/payments/overview',   requireAdmin, getPaymentsOverview);
+router.get('/payouts',             requireAdmin, listPayouts);
+router.post('/payouts',            requireAdmin, createPayout);
+router.post('/payouts/:id/refresh', requireAdmin, refreshPayout);
 
 export default router;

@@ -7,6 +7,9 @@ import {
   getVendorShipment,
   dispatchShipment,
   advanceShipmentStatus,
+  getVendorPayments,
+  getVendorPayoutAccount,
+  saveVendorPayoutAccount,
 } from '../controllers/vendor.controller';
 import { requireVendor } from '../middleware/auth.middleware';
 import { validate } from '../middleware/validate';
@@ -18,6 +21,11 @@ const router = Router();
 router.get('/profile', requireVendor, getVendorProfile);
 router.put('/profile', requireVendor, validate(updateVendorProfileSchema), updateVendorProfile);
 router.get('/dashboard-summary', requireVendor, getVendorDashboardSummary);
+
+// Earnings and payouts
+router.get('/payments',        requireVendor, getVendorPayments);
+router.get('/payout-account',  requireVendor, getVendorPayoutAccount);
+router.put('/payout-account',  requireVendor, saveVendorPayoutAccount);
 
   router.get('/orders',                       requireVendor, getVendorOrders);
   router.get('/orders/:shipmentId',           requireVendor, getVendorShipment);

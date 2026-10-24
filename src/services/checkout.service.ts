@@ -4,6 +4,7 @@ import { calculateShipping, ShippingCalculationResult } from './shipping.service
 import { calculateTax, TaxCalculationResult } from './tax.service';
 import { validatePromotion } from './promotion.service';
 import { ShippingAddressInput } from '../schemas/checkout.schema';
+import { checkoutCurrency } from './payments';
 
 export interface CheckoutItemSnapshot {
   cart_item_id: string;
@@ -56,7 +57,7 @@ export class CheckoutError extends Error {
 export async function calculateCheckout(
   userId: string,
   shippingAddress: ShippingAddressInput,
-  currency = process.env.CHECKOUT_CURRENCY || 'USD',
+  currency = checkoutCurrency(),
   /**
    * The promo CODE, never a discount amount. The amount is derived below from a
    * subtotal this function calculated itself — if the client could send a

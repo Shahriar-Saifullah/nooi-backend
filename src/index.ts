@@ -18,7 +18,7 @@ import profileRoutes        from './routes/profile.routes';
 import sharedRoutes         from './routes/shared.routes';
 import notificationRoutes   from './routes/notifications.routes';
 import { errorHandler }     from './middleware/errorHandler';
-import { stripeWebhookHandler } from './controllers/orders.controller';
+import { stripeWebhookHandler, moyasarWebhookHandler } from './controllers/orders.controller';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -39,6 +39,9 @@ app.post('/orders/webhook', express.raw({ type: 'application/json' }), stripeWeb
 
 app.use(express.json({ limit: '12mb' }));
 app.use(cookieParser());
+
+// Moyasar webhooks: JSON, authenticated by the secret token in the body
+app.post('/payments/moyasar/webhook', moyasarWebhookHandler);
 
 // Health check
 app.get('/health', (req, res) => {
