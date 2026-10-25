@@ -33,6 +33,7 @@ import {
   refreshPayout,
   getVendorPayoutAccount,
   verifyVendorPayoutAccount,
+  markShipmentDelivered,
 } from '../controllers/admin.controller';
 import { requireAdmin } from '../middleware/auth.middleware';
 import { validate } from '../middleware/validate';
@@ -88,6 +89,7 @@ router.get('/orders/:id',           requireAdmin, getOrderForIntervention);
 router.post('/orders/:id/override', requireAdmin, overrideOrderStatus);
 router.post('/orders/:id/cancel',   requireAdmin, cancelOrderAsAdmin);
 router.post('/orders/:id/approve',  requireAdmin, approveOrder);
+router.post('/orders/:id/shipments/:shipmentId/delivered', requireAdmin, markShipmentDelivered);
 
 // Payments and vendor payouts
 router.get('/payments/overview',   requireAdmin, getPaymentsOverview);
