@@ -1,6 +1,6 @@
 import { Response } from 'express';
 import { refundOrderPayment, money, payoutHoldDays } from '../services/payments';
-import { reverseEarnings, releaseEarnings } from '../services/payments/earnings.service';
+import { reverseEarnings, releaseEarnings, recordOrderEarnings } from '../services/payments/earnings.service';
 import {
   createVendorPayout, syncOpenPayouts, syncPayout, sendPayout, PayoutError,
 } from '../services/payments/payouts.service';
@@ -2291,6 +2291,9 @@ export async function approveOrder(req: AuthRequest, res: Response) {
   const adminId = req.user?.id;
   if (!adminId) return res.status(401).json({ success: false, error: 'Authentication required' });
   try {
+    // Repairs orders whose earnings were never written (idempotent).
+    await recordOrderEarnings(id).catch(err =>
+      console.error('[approve] could not record earnings', { order_id: id, error: err?.message }));
     const { data, error } = await supabase.rpc('approve_order', {
       p_order_id: id, p_admin_id: adminId, p_hold_days: payoutHoldDays(),
     });
@@ -2497,4 +2500,52 @@ export async function verifyVendorPayoutAccount(req: AuthRequest, res: Response)
   await supabase.from('vendor_profiles').update({ payout_connected: true }).eq('id', vendorId);
   await audit(req, 'vendor.payout_account_verified', 'vendor', vendorId, `Verified payout account ${maskIban(acct.iban)}`);
   return res.json({ success: true, message: 'Bank account verified' });
+}
+
+/**
+ * router.post('/orders/:id/shipments/:shipmentId/delivered', requireAdmin, markShipmentDelivered)
+ * body: { note }
+ *
+ * Confirms delivery by hand: the carrier has no automatic tracking yet, or it
+ * never sent the final scan and the customer (or proof of delivery) confirms
+ * it arrived. This is what makes the vendor's share payable, so a reason is
+ * required and it goes in the audit log.
+ */
+export async function markShipmentDelivered(req: AuthRequest, res: Response) {
+  const orderId = req.params.id as string;
+  const shipmentId = req.params.shipmentId as string;
+  const note = String(req.body?.note ?? '').trim();
+  if (!req.user?.id) return res.status(401).json({ success: false, error: 'Authentication required' });
+  if (!note) return res.status(400).json({ success: false, error: 'Say how delivery was confirmed.' });
+  try {
+    const { data: s } = await supabase.from('order_shipments')
+      .select('id, order_id, retailer_id, shipment_status').eq('id', shipmentId).eq('order_id', orderId).maybeSingle();
+    if (!s) return res.status(404).json({ success: false, error: 'Shipment not found' });
+    if (s.shipment_status === 'delivered') return res.status(409).json({ success: false, error: 'Already delivered.' });
+    if (s.shipment_status === 'cancelled') return res.status(409).json({ success: false, error: 'This shipment was cancelled.' });
+
+    const now = new Date().toISOString();
+    const { error } = await supabase.from('order_shipments')
+      .update({ shipment_status: 'delivered', delivered_at: now, updated_at: now })
+      .eq('id', shipmentId).neq('shipment_status', 'delivered');
+    if (error) return res.status(400).json({ success: false, error: error.message });
+
+    await supabase.from('order_items').update({ item_status: 'delivered' })
+      .eq('order_id', orderId).eq('retailer_id', s.retailer_id)
+      .not('item_status', 'in', '("returned","cancelled")');
+    await supabase.from('order_tracking_events').insert({
+      shipment_id: shipmentId, status: 'delivered', timestamp: now,
+      description: `Delivery confirmed by Nooi: ${note.slice(0, 160)}`,
+    });
+    await recordOrderEarnings(orderId).catch(() => undefined);
+    await releaseEarnings(orderId);
+
+    const { data: order } = await supabase.from('orders').select('order_number').eq('id', orderId).maybeSingle();
+    await audit(req, 'shipment.delivered', 'order', orderId,
+      `Marked a shipment on ${order?.order_number ?? orderId} delivered: ${note.slice(0, 140)}`, { shipment_id: shipmentId, note });
+    return res.json({ success: true, message: 'Marked delivered' });
+  } catch (err) {
+    console.error('markShipmentDelivered error:', err);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
 }

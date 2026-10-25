@@ -848,7 +848,13 @@ const MOYASAR_METHODS = (process.env.MOYASAR_METHODS || 'creditcard,stcpay')
   .split(',').map(s => s.trim()).filter(Boolean);
 
 function moyasarFormConfig(attempt: { id: string; grand_total_cents: number; currency: string }, summary: any) {
-  const frontend = (process.env.FRONTEND_URL || '').split(',')[0].trim().replace(/\/$/, '');
+  // Moyasar needs an absolute https URL. Prefer an explicit setting, then the
+  // first https, non-localhost FRONTEND_URL entry. (The browser overrides this
+  // with its own origin anyway.)
+  const origins = (process.env.FRONTEND_URL || '').split(',').map(u => u.trim().replace(/\/$/, '')).filter(Boolean);
+  const frontend = (process.env.CHECKOUT_RETURN_ORIGIN || '').replace(/\/$/, '')
+    || origins.find(u => u.startsWith('https://') && !u.includes('localhost'))
+    || origins[0] || '';
   const config: Record<string, any> = {
     publishable_api_key: process.env.MOYASAR_PUBLISHABLE_KEY || '',
     amount: Number(attempt.grand_total_cents),
