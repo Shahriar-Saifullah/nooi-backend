@@ -6,6 +6,7 @@ import {
 } from '../services/payments/payouts.service';
 import { fromMinor, maskIban, summarise } from '../services/payments/ledger';
 import { supabase } from '../services/supabase';
+import { cancelWholeOrder } from '../services/cancellation.service';
 import { AuthRequest } from '../types';
 import {
   UpdateVendorStatusInput,
@@ -822,14 +823,30 @@ export async function getAdminOverview(req: AuthRequest, res: Response) {
       }
     }
 
-    // ── Not built yet ────────────────────────────────────────────────────
-    // Declared so the dashboard can show the shape of the job, with
-    // available:false so it never claims a count it cannot know.
-    queues.push(
-      { key: 'listings', label: 'Listing approvals', href: '/admin/listings', count: 0, oldest: null, available: false },
-      { key: 'cancellations', label: 'Cancellations', href: '/admin/cancellations', count: 0, oldest: null, available: false },
-      { key: 'support', label: 'Support', href: '/admin/support', count: 0, oldest: null, available: false },
-    );
+    // ── Listings, cancellations, support ─────────────────────────────────
+    const [pendListings, openCancels, openTickets] = await Promise.all([
+      supabase.from('products').select('id, title, submitted_at').eq('listing_status', 'pending')
+        .order('submitted_at', { ascending: true }),
+      supabase.from('order_cancellation_requests').select('id, order_id, reason, created_at')
+        .in('status', ['requested', 'processing']).order('created_at', { ascending: true }),
+      supabase.from('support_tickets').select('id, number, subject, last_message_at').eq('status', 'open')
+        .order('last_message_at', { ascending: true }),
+    ]);
+    const queue = (key: string, label: string, href: string, rows: any[] | null, err: any, at: string) => {
+      queues.push({ key, label, href, count: (rows || []).length, oldest: rows?.[0]?.[at] || null, available: !err });
+    };
+    queue('listings', 'Listing approvals', '/admin/listings', pendListings.data, pendListings.error, 'submitted_at');
+    queue('cancellations', 'Cancellations', '/admin/cancellations', openCancels.data, openCancels.error, 'created_at');
+    queue('support', 'Support', '/admin/support', openTickets.data, openTickets.error, 'last_message_at');
+    for (const l of (pendListings.data || []).slice(0, 5)) {
+      oldestItems.push({ queue: 'Listing', title: l.title, ref: l.id, href: `/admin/listings?id=${l.id}`, since: l.submitted_at });
+    }
+    for (const c of (openCancels.data || []).slice(0, 5)) {
+      oldestItems.push({ queue: 'Cancellation', title: c.reason?.slice(0, 60) || 'Cancellation request', ref: c.order_id, href: `/admin/cancellations?id=${c.id}`, since: c.created_at });
+    }
+    for (const t of (openTickets.data || []).slice(0, 5)) {
+      oldestItems.push({ queue: 'Support', title: `#${t.number} ${t.subject}`, ref: t.id, href: `/admin/support?id=${t.id}`, since: t.last_message_at });
+    }
 
     // Oldest first across every queue — the point of the panel is that the
     // thing waiting longest is rarely in the queue you happen to open.
@@ -2147,105 +2164,22 @@ export async function cancelOrderAsAdmin(req: AuthRequest, res: Response) {
 
   try {
     const { data: order } = await supabase
-      .from('orders')
-      .select('id, order_number, payment_intent_id, payment_provider, currency, user_id, status')
-      .eq('id', id)
-      .maybeSingle();
+      .from('orders').select('order_number, user_id, currency').eq('id', id).maybeSingle();
+    const r = await cancelWholeOrder({ orderId: id, adminId, note });
+    if (!r.ok) return res.status(r.status).json({ success: false, error: r.error, ...(r.data ? { data: r.data } : {}) });
 
-    if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
-
-    // 1. Claim. Returns what is left to refund after any returns already paid.
-    const { data: claimData, error: claimError } = await supabase.rpc('claim_order_cancellation', {
-      p_order_id: id,
-      p_admin_id: adminId,
-    });
-
-    if (claimError) return res.status(400).json({ success: false, error: claimError.message });
-
-    const claim: any = Array.isArray(claimData) ? claimData[0] : claimData;
-    if (!claim?.claimed) {
-      const current = claim?.current_status ?? null;
- 
-      // Genuinely settled — someone else got there, or it was already done.
-      if (current === 'cancelled' || current === 'cancelling' || current === 'refunded') {
-        return res.status(409).json({
-          success: false,
-          error: 'already_handled',
-          data: { current_status: current },
-        });
-      }
- 
-      // Anything else: the order is in a state this function will not claim.
-      // Say which, rather than implying a colleague acted.
-      return res.status(409).json({
-        success: false,
-        error: `An order with status "${current}" cannot be cancelled.`,
-        data: { current_status: current },
-      });
-    }
-
-    const amount = Number(claim.refundable ?? 0);
-
-    // 2. Refund, if there is anything left and a payment to refund against.
-    let refundId: string | null = null;
-    if (amount > 0 && order.payment_intent_id) {
-      try {
-        const refund = await refundOrderPayment({
-          provider: order.payment_provider,
-          paymentId: order.payment_intent_id,
-          amountMinor: Math.round(amount * 100),
-          key: `order-cancel-${id}`,
-          metadata: { order_id: id, order_number: order.order_number ?? '', reason: note.slice(0, 200) },
-        });
-        refundId = refund.id;
-      } catch (stripeErr: any) {
-        await supabase.rpc('settle_order_cancellation', {
-          p_order_id: id,
-          p_succeeded: false,
-          p_refund_id: null,
-          p_note: `Cancellation failed at refund: ${stripeErr?.message ?? 'unknown'}`,
-        });
-        console.error('[admin] cancel refund failed', { order_id: id, error: stripeErr?.message });
-        return res.status(502).json({
-          success: false,
-          error: stripeErr?.message || 'The payment provider rejected the refund.',
-        });
-      }
-    }
-
-    // 3. Settle: cancel the order, items and shipments, restore stock.
-    const { data: settled, error: settleError } = await supabase.rpc('settle_order_cancellation', {
-      p_order_id: id,
-      p_succeeded: true,
-      p_refund_id: refundId,
-      p_note: note,
-    });
-
-    if (settleError) {
-      console.error('[admin] cancel refunded but settle failed', {
-        order_id: id, refund_id: refundId, error: settleError.message,
-      });
-      return res.status(500).json({
-        success: false,
-        error: refundId
-          ? `The refund went through (${refundId}) but the order could not be updated. Do not cancel again — fix the record instead.`
-          : 'The order could not be cancelled.',
-      });
-    }
-
-    await reverseEarnings(id, null, `Order cancelled: ${note}`);
-
+    const amount = r.amount;
     await supabase.from('admin_audit_log').insert({
       actor_id: adminId,
       actor_email: req.user?.email || null,
       action: 'order.cancelled',
       entity_type: 'order',
       entity_id: id,
-      summary: `Cancelled ${order.order_number}${amount > 0 ? ` and refunded ${money(amount, order.currency)}` : ''}: ${note.slice(0, 140)}`,
-      metadata: { note, refund_amount: amount, refund_id: refundId },
+      summary: `Cancelled ${order?.order_number}${amount > 0 ? ` and refunded ${money(amount, order?.currency)}` : ''}: ${note.slice(0, 140)}`,
+      metadata: { note, refund_amount: amount, refund_id: r.refundId },
     });
 
-    if (order.user_id) {
+    if (order?.user_id) {
       await supabase.from('notifications').insert({
         user_id: order.user_id,
         title: `Order ${order.order_number} has been cancelled`,
@@ -2256,17 +2190,17 @@ export async function cancelOrderAsAdmin(req: AuthRequest, res: Response) {
       });
     }
 
-    const row: any = Array.isArray(settled) ? settled[0] : settled;
     return res.status(200).json({
       success: true,
-      data: { status: row?.final_status ?? 'cancelled', refund_id: refundId, refunded: amount },
-      message: amount > 0 ? `Cancelled and refunded ${money(amount, order.currency)}` : 'Order cancelled',
+      data: { status: r.finalStatus, refund_id: r.refundId, refunded: amount },
+      message: amount > 0 ? `Cancelled and refunded ${money(amount, order?.currency)}` : 'Order cancelled',
     });
   } catch (err) {
     console.error('cancelOrderAsAdmin error:', err);
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }
+
 // ════════════════════════════════════════════════════════════════════════════
 // Payments: order approval, Nooi's balance, vendor payouts
 // ════════════════════════════════════════════════════════════════════════════
@@ -2295,7 +2229,7 @@ export async function approveOrder(req: AuthRequest, res: Response) {
     await recordOrderEarnings(id).catch(err =>
       console.error('[approve] could not record earnings', { order_id: id, error: err?.message }));
     const { data, error } = await supabase.rpc('approve_order', {
-      p_order_id: id, p_admin_id: adminId, p_hold_days: payoutHoldDays(),
+      p_order_id: id, p_admin_id: adminId, p_hold_days: await payoutHoldDays(),
     });
     if (error) return res.status(400).json({ success: false, error: error.message });
     const row: any = Array.isArray(data) ? data[0] : data;
@@ -2379,7 +2313,7 @@ export async function getPaymentsOverview(req: AuthRequest, res: Response) {
       success: true,
       data: {
         currency: 'SAR',
-        hold_days: payoutHoldDays(),
+        hold_days: await payoutHoldDays(),
         totals: {
           collected: Number(collected.toFixed(2)),
           vat_collected: Number(vat.toFixed(2)),

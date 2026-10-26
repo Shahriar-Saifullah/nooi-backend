@@ -10,6 +10,7 @@ import {
   confirmMoyasarPayment,
 } from '../controllers/orders.controller';
 import { requireAuth } from '../middleware/auth.middleware';
+import { requestOrderCancellation, getOrderCancellation } from '../controllers/cancellations.controller';
 
 const router = Router();
 
@@ -26,5 +27,7 @@ router.post('/moyasar/confirm',  requireAuth, confirmMoyasarPayment);
 router.get('/', requireAuth, getUserOrders);
 router.get('/:id', requireAuth, getOrderById);
 router.post('/:id/returns', requireAuth, submitReturnRequest);
+router.get('/:id/cancellation',  requireAuth, getOrderCancellation);
+router.post('/:id/cancellation', requireAuth, requestOrderCancellation);
 
 export default router;

@@ -188,7 +188,9 @@ export const getProducts = async (req: Request, res: Response) => {
          retailers(id, name, logo_url, shipping_policy_json),
          product_variants(*)`,
         { count: 'exact' },
-      );
+      )
+      // Only listings an admin has approved are on sale.
+      .eq('listing_status', 'approved');
  
     if (group && group !== 'All') {
       query = query.eq('furniture_types.shop_group', String(group));
@@ -274,6 +276,7 @@ export const getProductById = async (req: Request, res: Response) => {
          product_reviews(*)`,
       )
       .eq('id', id)
+      .eq('listing_status', 'approved')
       .maybeSingle();
  
     if (error) {
@@ -351,7 +354,8 @@ export const getCanvasProductLink = async (req: Request, res: Response) => {
          retailers(id, name, logo_url, shipping_policy_json),
          product_variants(*)`,
       )
-      .eq('canvas_model_id', canvasModelId);
+      .eq('canvas_model_id', canvasModelId)
+      .eq('listing_status', 'approved');
  
     if (error) {
       console.error('[canvas-link] query failed:', error);
@@ -422,7 +426,7 @@ export const getFacets = async (_req: Request, res: Response) => {
     const [groupsRes, vendorsRes, priceRes] = await Promise.all([
       supabase.from('products_shop').select('shop_group, group_sort'),
       supabase.from('retailers').select('id, name, logo_url').order('name'),
-      supabase.from('products').select('base_price').order('base_price', { ascending: true }),
+      supabase.from('products').select('base_price').eq('listing_status', 'approved').order('base_price', { ascending: true }),
     ]);
  
     if (groupsRes.error)  throw groupsRes.error;
