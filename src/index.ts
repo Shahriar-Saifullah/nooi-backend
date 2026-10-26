@@ -17,6 +17,7 @@ import onboardingRoutes     from './routes/onboarding.routes';
 import profileRoutes        from './routes/profile.routes';
 import sharedRoutes         from './routes/shared.routes';
 import notificationRoutes   from './routes/notifications.routes';
+import supportRoutes        from './routes/support.routes';
 import { errorHandler }     from './middleware/errorHandler';
 import { stripeWebhookHandler, moyasarWebhookHandler } from './controllers/orders.controller';
 
@@ -61,6 +62,7 @@ app.use('/onboarding',     onboardingRoutes);
 app.use('/profile',        profileRoutes);
 app.use('/shared',         sharedRoutes);
 app.use('/notifications',  notificationRoutes);
+app.use('/support',        supportRoutes);
 
 // Error handler
 app.use(errorHandler);

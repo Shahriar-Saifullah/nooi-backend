@@ -11,6 +11,7 @@
 
 import { stripe } from '../stripe';
 import { moyasar, MoyasarError } from './moyasar';
+import { getSettings } from '../settings.service';
 
 export type Provider = 'stripe' | 'moyasar';
 
@@ -24,10 +25,9 @@ export function checkoutCurrency(): string {
   return activeProvider() === 'moyasar' ? 'SAR' : 'USD';
 }
 
-/** Days after delivery before a vendor's earnings can be paid out. */
-export function payoutHoldDays(): number {
-  const n = Number(process.env.PAYOUT_HOLD_DAYS ?? 0);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+/** Days after delivery before a vendor's earnings can be paid out (admin Settings). */
+export async function payoutHoldDays(): Promise<number> {
+  return (await getSettings()).payout_hold_days;
 }
 
 /** Format an amount for messages: "SAR 1,250.00". */

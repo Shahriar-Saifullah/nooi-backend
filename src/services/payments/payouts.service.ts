@@ -14,13 +14,13 @@
 import { supabase } from '../supabase';
 import { moyasar, MoyasarError, MoyasarPayout } from './moyasar';
 import { payoutHoldDays } from './index';
+import { getSettings } from '../settings.service';
 
 export class PayoutError extends Error {
   status: number;
   constructor(message: string, status = 400) { super(message); this.status = status; }
 }
 
-const MIN_PAYOUT_MINOR = Math.max(100, Math.round(Number(process.env.PAYOUT_MIN_SAR || 1) * 100));
 
 function claimErrorMessage(msg: string): PayoutError {
   if (msg.includes('NO_PAYOUT_ACCOUNT')) return new PayoutError('This vendor has not added a bank account.', 409);
@@ -81,8 +81,8 @@ export async function createVendorPayout(vendorId: string, adminId: string) {
   const { data: payoutId, error } = await supabase.rpc('claim_vendor_payout', {
     p_vendor_id: vendorId,
     p_admin_id: adminId,
-    p_hold_days: payoutHoldDays(),
-    p_min_minor: MIN_PAYOUT_MINOR,
+    p_hold_days: await payoutHoldDays(),
+    p_min_minor: Math.max(100, Math.round((await getSettings()).min_payout_sar * 100)),
   });
   if (error) throw claimErrorMessage(error.message);
   return sendPayout(payoutId as unknown as string);

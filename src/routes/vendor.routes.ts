@@ -12,6 +12,7 @@ import {
   saveVendorPayoutAccount,
 } from '../controllers/vendor.controller';
 import { requireVendor } from '../middleware/auth.middleware';
+import { requestShipmentCancellation, getShipmentCancellation } from '../controllers/cancellations.controller';
 import { validate } from '../middleware/validate';
 import { updateVendorProfileSchema } from '../schemas/auth.schema';
 
@@ -28,6 +29,8 @@ router.get('/payout-account',  requireVendor, getVendorPayoutAccount);
 router.put('/payout-account',  requireVendor, saveVendorPayoutAccount);
 
   router.get('/orders',                       requireVendor, getVendorOrders);
+  router.get('/orders/:shipmentId/cancellation',  requireVendor, getShipmentCancellation);
+  router.post('/orders/:shipmentId/cancellation', requireVendor, requestShipmentCancellation);
   router.get('/orders/:shipmentId',           requireVendor, getVendorShipment);
   router.post('/orders/:shipmentId/dispatch', requireVendor, dispatchShipment);
   router.post('/orders/:shipmentId/status',   requireVendor, advanceShipmentStatus);

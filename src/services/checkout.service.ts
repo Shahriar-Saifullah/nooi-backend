@@ -93,6 +93,13 @@ export async function calculateCheckout(
       throw new CheckoutError(`Variant ${item.variant_id} not found`, 404);
     }
 
+    // A listing taken off sale (or never approved) cannot be bought, even if it
+    // is still sitting in someone's cart.
+    const listing = variant.products?.listing_status;
+    if (listing && listing !== 'approved') {
+      throw new CheckoutError(`"${variant.products?.title || 'A product'}" is no longer available. Remove it from your cart to continue.`, 422);
+    }
+
     if (variant.is_active === false) {
       throw new CheckoutError(`Product variant "${variant.sku || item.variant_id}" is no longer active`, 422);
     }

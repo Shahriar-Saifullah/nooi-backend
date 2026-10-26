@@ -36,6 +36,12 @@ import {
   markShipmentDelivered,
 } from '../controllers/admin.controller';
 import { requireAdmin } from '../middleware/auth.middleware';
+import {
+  listListings, getListing, decideListing,
+  listCancellations, getCancellation, approveCancellation, declineCancellation,
+  listSupportTickets, getSupportTicket, replySupportTicket, setSupportStatus,
+  getPlatformSettings, updatePlatformSettings, getPaymentStatus, getMe, updateMe, changeMyPassword, getOpsCounts,
+} from '../controllers/ops.controller';
 import { validate } from '../middleware/validate';
 import {
   updateVendorStatusSchema,
@@ -96,5 +102,31 @@ router.get('/payments/overview',   requireAdmin, getPaymentsOverview);
 router.get('/payouts',             requireAdmin, listPayouts);
 router.post('/payouts',            requireAdmin, createPayout);
 router.post('/payouts/:id/refresh', requireAdmin, refreshPayout);
+
+// Listing review
+router.get('/listings',                 requireAdmin, listListings);
+router.get('/listings/:id',             requireAdmin, getListing);
+router.post('/listings/:id/decision',   requireAdmin, decideListing);
+
+// Cancellation requests
+router.get('/cancellations',              requireAdmin, listCancellations);
+router.get('/cancellations/:id',          requireAdmin, getCancellation);
+router.post('/cancellations/:id/approve', requireAdmin, approveCancellation);
+router.post('/cancellations/:id/decline', requireAdmin, declineCancellation);
+
+// Support tickets
+router.get('/support',              requireAdmin, listSupportTickets);
+router.get('/support/:id',          requireAdmin, getSupportTicket);
+router.post('/support/:id/reply',   requireAdmin, replySupportTicket);
+router.post('/support/:id/status',  requireAdmin, setSupportStatus);
+
+// Settings and my account
+router.get('/settings',          requireAdmin, getPlatformSettings);
+router.put('/settings',          requireAdmin, updatePlatformSettings);
+router.get('/settings/payments', requireAdmin, getPaymentStatus);
+router.get('/me',                requireAdmin, getMe);
+router.put('/me',                requireAdmin, updateMe);
+router.put('/me/password',       requireAdmin, changeMyPassword);
+router.get('/ops/counts',        requireAdmin, getOpsCounts);
 
 export default router;

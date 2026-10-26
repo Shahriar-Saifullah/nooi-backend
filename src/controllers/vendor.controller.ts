@@ -613,7 +613,7 @@ export async function getVendorPayments(req: AuthRequest, res: Response) {
       success: true,
       data: {
         currency: 'SAR',
-        hold_days: payoutHoldDays(),
+        hold_days: await payoutHoldDays(),
         balance: {
           pending: fromMinor(sum.pending_minor),
           payable: fromMinor(sum.payable_minor),

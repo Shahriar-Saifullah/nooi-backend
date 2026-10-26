@@ -23,7 +23,7 @@ export async function recordOrderEarnings(orderId: string, _snapshot?: unknown, 
 export async function releaseEarnings(orderId?: string) {
   const { data, error } = await supabase.rpc('release_vendor_earnings', {
     p_order_id: orderId ?? null,
-    p_hold_days: payoutHoldDays(),
+    p_hold_days: await payoutHoldDays(),
   });
   if (error) console.error('[earnings] release failed', { order_id: orderId, error: error.message });
   return Number(data || 0);

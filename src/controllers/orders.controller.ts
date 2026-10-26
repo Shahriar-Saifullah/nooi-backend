@@ -10,6 +10,7 @@ import { AuthRequest } from '../types';
 import { Provider, checkoutCurrency } from '../services/payments';
 import { moyasar, MoyasarError } from '../services/payments/moyasar';
 import { syncPayoutByProviderId } from '../services/payments/payouts.service';
+import { getSettings } from '../services/settings.service';
 import { recordOrderEarnings } from '../services/payments/earnings.service';
 
 export const createPaymentIntent = async (req: Request, res: Response) => {
@@ -681,7 +682,6 @@ export const getOrderById = async (req: Request, res: Response) => {
  */
 
 /** Days after delivery during which a return may be raised. */
-const RETURN_WINDOW_DAYS = 30;
 
 export const submitReturnRequest = async (req: Request, res: Response) => {
   try {
@@ -772,6 +772,7 @@ export const submitReturnRequest = async (req: Request, res: Response) => {
     const deliveredAt = shipment.delivered_at ? new Date(shipment.delivered_at) : null;
     if (deliveredAt) {
       const days = Math.floor((Date.now() - deliveredAt.getTime()) / 86_400_000);
+      const RETURN_WINDOW_DAYS = (await getSettings()).return_window_days;
       if (days > RETURN_WINDOW_DAYS) {
         return res.status(400).json({
           success: false,
