@@ -5,104 +5,84 @@ import { calculateShipping } from '../services/shipping.service';
 import { calculateTax } from '../services/tax.service';
 import { validatePromotion } from '../services/promotion.service';
 
-// Memory fallback store for sessions when DB table is empty/local dev
-const mockCartMemory: Record<string, any[]> = {};
+/**
+ * Cart — the signed-in shopper's server cart (cart_items).
+ * ============================================================================
+ * Every route here is behind requireAuth (cart.routes.ts), and every query is
+ * scoped to req.user.id. Earlier versions:
+ *   - fell back to a shared 'default_session' and read
+ *     `user_id = me OR session_id = 'default_session'`, and every insert wrote
+ *     that same session id, so each shopper's cart included everyone's rows;
+ *     the client then "reconciled" by deleting the rows it didn't recognise —
+ *     i.e. other people's items;
+ *   - updated and deleted rows by id alone, so any signed-in user could edit
+ *     or remove anyone's cart line;
+ *   - swallowed database errors and answered success with an in-memory fake
+ *     cart (a "West Elm" item at 495), so failures looked like successes.
+ * None of that is kept. Errors are errors.
+ */
+
+type Req = Request & { user?: { id: string } };
+
+const CART_SELECT = '*, product_variants(*, products(*, retailers(*)))';
+
+/** Whether a variant can be put in a cart right now, and why not if not. */
+async function checkVariant(variantId: string): Promise<{ ok: true; stock: number } | { ok: false; status: number; error: string }> {
+  const { data: v } = await supabase
+    .from('product_variants')
+    .select('id, is_active, stock_quantity, products ( listing_status, title )')
+    .eq('id', variantId)
+    .maybeSingle();
+  if (!v) return { ok: false, status: 404, error: 'VARIANT_NOT_FOUND' };
+  const product: any = (v as any).products;
+  if (v.is_active === false || (product?.listing_status && product.listing_status !== 'approved')) {
+    return { ok: false, status: 422, error: 'VARIANT_UNAVAILABLE' };
+  }
+  return { ok: true, stock: Number(v.stock_quantity ?? 0) };
+}
+
+const isUuid = (s: unknown): s is string =>
+  typeof s === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
 
 export const getCart = async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).user?.id;
-    const sessionId = (req.query.session_id as string) || req.cookies?.cart_session || 'default_session';
-
-    const { data, error } = await supabase
-      .from('cart_items')
-      .select('*, product_variants(*, products(*, retailers(*)))')
-      .or(userId ? `user_id.eq.${userId},session_id.eq.${sessionId}` : `session_id.eq.${sessionId}`);
-
-    if (error || !data || data.length === 0) {
-      const items = mockCartMemory[userId || sessionId] || [];
-      return res.json({ success: true, items, is_mock: true });
-    }
-
-    return res.json({ success: true, items: data, is_mock: false });
+    const userId = (req as Req).user!.id;
+    const { data, error } = await supabase.from('cart_items').select(CART_SELECT).eq('user_id', userId);
+    if (error) return res.status(500).json({ success: false, error: error.message });
+    return res.json({ success: true, items: data ?? [] });
   } catch (err: any) {
-    return res.status(500).json({ success: false, message: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 };
 
+/** POST /cart/items { variant_id, quantity } — adds to the line if it exists. */
 export const addToCart = async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).user?.id || null;
-    const sessionId = (req.body.session_id as string) || req.cookies?.cart_session || 'default_session';
-    const { variant_id, quantity = 1, product_data } = req.body;
+    const userId = (req as Req).user!.id;
+    const { variant_id, quantity = 1 } = req.body;
+    if (!isUuid(variant_id)) return res.status(404).json({ success: false, error: 'VARIANT_NOT_FOUND' });
 
-    if (!variant_id) {
-      return res.status(400).json({ success: false, message: 'variant_id is required' });
-    }
+    const check = await checkVariant(variant_id);
+    if (!check.ok) return res.status(check.status).json({ success: false, error: check.error });
 
-    // Check existing item for upsert logic
-    let query = supabase.from('cart_items').select('*');
-    if (userId) {
-      query = query.eq('user_id', userId).eq('variant_id', variant_id);
-    } else {
-      query = query.eq('session_id', sessionId).eq('variant_id', variant_id);
-    }
+    const { data: existing, error: readErr } = await supabase
+      .from('cart_items').select('id, quantity')
+      .eq('user_id', userId).eq('variant_id', variant_id).maybeSingle();
+    if (readErr) return res.status(500).json({ success: false, error: readErr.message });
 
-    const { data: existingItem } = await query.maybeSingle();
+    const { data, error } = existing
+      ? await supabase.from('cart_items')
+          .update({ quantity: existing.quantity + Number(quantity), updated_at: new Date().toISOString() })
+          .eq('id', existing.id).eq('user_id', userId)
+          .select(CART_SELECT).single()
+      : await supabase.from('cart_items')
+          .insert({ user_id: userId, session_id: null, variant_id, quantity: Number(quantity) })
+          .select(CART_SELECT).single();
+    if (error) return res.status(500).json({ success: false, error: error.message });
 
-    let resultData;
-    if (existingItem) {
-      const newQty = existingItem.quantity + quantity;
-      const { data, error } = await supabase
-        .from('cart_items')
-        .update({ quantity: newQty, updated_at: new Date().toISOString() })
-        .eq('id', existingItem.id)
-        .select('*, product_variants(*, products(*, retailers(*)))')
-        .single();
-      resultData = data;
-    } else {
-      const { data, error } = await supabase
-        .from('cart_items')
-        .insert({
-          user_id: userId,
-          session_id: sessionId,
-          variant_id,
-          quantity
-        })
-        .select('*, product_variants(*, products(*, retailers(*)))')
-        .single();
-      resultData = data;
-    }
-
-    if (!resultData) {
-      const key = userId || sessionId;
-      if (!mockCartMemory[key]) mockCartMemory[key] = [];
-      
-      const existing = mockCartMemory[key].find(item => item.variant_id === variant_id);
-      if (existing) {
-        existing.quantity += quantity;
-      } else {
-        mockCartMemory[key].push({
-          id: `cart-item-${Date.now()}`,
-          user_id: userId,
-          session_id: sessionId,
-          variant_id,
-          quantity,
-          product_data: product_data || {
-            title: 'Modern Furniture Item',
-            price: 495.00,
-            retailer_name: 'West Elm',
-            color: 'Default',
-            image: '/assets/sofa.png'
-          }
-        });
-      }
-
-      return res.json({ success: true, items: mockCartMemory[key], is_mock: true });
-    }
-
-    return res.json({ success: true, item: resultData });
+    return res.json({ success: true, item: data });
   } catch (err: any) {
-    return res.status(500).json({ success: false, message: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 };
 
@@ -120,7 +100,7 @@ export const quoteCart = async (req: Request, res: Response) => {
         product_variants (
           id, price, color, sku, images, stock_quantity, is_active,
           products (
-            id, title, lead_time_days,
+            id, title, lead_time_days, listing_status,
             retailers ( id, name, logo_url, city, country, shipping_policy_json )
           )
         )
@@ -156,8 +136,17 @@ export const quoteCart = async (req: Request, res: Response) => {
  
       const unit = Number(variant.price);
       const lineTotal = Number((unit * row.quantity).toFixed(2));
-      subtotal = Number((subtotal + lineTotal).toFixed(2));
-      itemCount += row.quantity;
+      // A line can be bought only if the listing is live, the variant active
+      // and there is enough stock. Anything else stays visible in the cart
+      // (so the shopper sees why) but is left out of every total.
+      const listed = product.listing_status === 'approved' && variant.is_active !== false;
+      const stock = Number(variant.stock_quantity ?? 0);
+      const available = listed && stock >= row.quantity;
+      const unavailableReason = !listed ? 'unavailable' : stock <= 0 ? 'out_of_stock' : stock < row.quantity ? 'not_enough_stock' : null;
+      if (available) {
+        subtotal = Number((subtotal + lineTotal).toFixed(2));
+        itemCount += row.quantity;
+      }
  
       if (!groups.has(retailer.id)) {
         groups.set(retailer.id, {
@@ -175,8 +164,11 @@ export const quoteCart = async (req: Request, res: Response) => {
       }
  
       const group = groups.get(retailer.id);
-      group.subtotal = Number((group.subtotal + lineTotal).toFixed(2));
-      group.lead_time_days = Math.max(group.lead_time_days, Number(product.lead_time_days ?? 14));
+      if (available) {
+        group.subtotal = Number((group.subtotal + lineTotal).toFixed(2));
+        group.lead_time_days = Math.max(group.lead_time_days, Number(product.lead_time_days ?? 14));
+        group._buyable = true;
+      }
       group.items.push({
         cart_item_id: row.id,
         variant_id: variant.id,
@@ -188,8 +180,10 @@ export const quoteCart = async (req: Request, res: Response) => {
         unit_price: unit,
         quantity: row.quantity,
         line_total: lineTotal,
-        in_stock: variant.stock_quantity > 0 && variant.is_active,
-        stock_quantity: variant.stock_quantity,
+        in_stock: available,
+        available,
+        unavailable_reason: unavailableReason,
+        stock_quantity: stock,
       });
     }
  
@@ -217,19 +211,28 @@ export const quoteCart = async (req: Request, res: Response) => {
     let taxTotal = 0;
     const out: any[] = [];
  
+    let unavailableCount = 0;
     for (const group of groups.values()) {
+      unavailableCount += group.items.filter((i: any) => !i.available).length;
+      if (!group._buyable) {
+        // Nothing in this shipment can be bought: no shipping or tax for it.
+        const { _policy, _buyable, ...clean } = group;
+        out.push({ ...clean, shipping_amount: 0, shipping_note: null, estimated_delivery: null, tax_amount: 0 });
+        continue;
+      }
+      const buyable = group.items.filter((i: any) => i.available);
       const shipping = calculateShipping(
         { id: group.retailer_id, name: group.retailer_name, shipping_policy_json: group._policy },
         group.subtotal,
         checkoutCurrency(),
         group.lead_time_days || null,
       );
-      const tax = calculateTax(group.items, group.subtotal, shipping.shipping_amount);
+      const tax = calculateTax(buyable, group.subtotal, shipping.shipping_amount);
  
       shippingTotal = Number((shippingTotal + shipping.shipping_amount).toFixed(2));
       taxTotal = Number((taxTotal + tax.tax_amount).toFixed(2));
  
-      const { _policy, ...clean } = group;
+      const { _policy, _buyable, ...clean } = group;
       out.push({
         ...clean,
         shipping_amount: shipping.shipping_amount,
@@ -247,6 +250,7 @@ export const quoteCart = async (req: Request, res: Response) => {
       success: true,
       groups: out,
       item_count: itemCount,
+      unavailable_count: unavailableCount,
       subtotal,
       shipping_total: shippingTotal,
       tax_total: taxTotal,
@@ -264,58 +268,37 @@ export const quoteCart = async (req: Request, res: Response) => {
 };
 
 
+/** PATCH /cart/items/:id { quantity } — only the caller's own line. 0 removes it. */
 export const updateCartItem = async (req: Request, res: Response) => {
   try {
+    const userId = (req as Req).user!.id;
     const { id } = req.params;
-    const { quantity } = req.body;
-    const userId = (req as any).user?.id;
-    const sessionId = (req.body.session_id as string) || 'default_session';
-    const key = userId || sessionId;
-
-    if (quantity <= 0) {
-      return removeCartItem(req, res);
-    }
+    const quantity = Number(req.body.quantity);
+    if (quantity <= 0) return removeCartItem(req, res);
 
     const { data, error } = await supabase
       .from('cart_items')
       .update({ quantity, updated_at: new Date().toISOString() })
-      .eq('id', id)
-      .select()
-      .single();
-
-    if (error || !data) {
-      if (mockCartMemory[key]) {
-        const item = mockCartMemory[key].find(i => i.id === id);
-        if (item) item.quantity = quantity;
-      }
-      return res.json({ success: true, items: mockCartMemory[key] || [], is_mock: true });
-    }
-
+      .eq('id', id).eq('user_id', userId)
+      .select().maybeSingle();
+    if (error) return res.status(500).json({ success: false, error: error.message });
+    if (!data) return res.status(404).json({ success: false, error: 'CART_ITEM_NOT_FOUND' });
     return res.json({ success: true, item: data });
   } catch (err: any) {
-    return res.status(500).json({ success: false, message: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 };
 
+/** DELETE /cart/items/:id — only the caller's own line. */
 export const removeCartItem = async (req: Request, res: Response) => {
   try {
+    const userId = (req as Req).user!.id;
     const { id } = req.params;
-    const userId = (req as any).user?.id;
-    const sessionId = (req.query.session_id as string) || 'default_session';
-    const key = userId || sessionId;
-
-    const { error } = await supabase.from('cart_items').delete().eq('id', id);
-
-    if (error) {
-      if (mockCartMemory[key]) {
-        mockCartMemory[key] = mockCartMemory[key].filter(i => i.id !== id);
-      }
-      return res.json({ success: true, items: mockCartMemory[key] || [], is_mock: true });
-    }
-
+    const { error } = await supabase.from('cart_items').delete().eq('id', id).eq('user_id', userId);
+    if (error) return res.status(500).json({ success: false, error: error.message });
     return res.json({ success: true, message: 'Item removed' });
   } catch (err: any) {
-    return res.status(500).json({ success: false, message: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 };
 
@@ -365,20 +348,6 @@ export const mergeCart = async (req: Request, res: Response) => {
       }
     }
 
-    // Also handle memory fallback cart
-    if (mockCartMemory[session_id]) {
-      if (!mockCartMemory[userId]) mockCartMemory[userId] = [];
-      for (const gItem of mockCartMemory[session_id]) {
-        const uItem = mockCartMemory[userId].find(i => i.variant_id === gItem.variant_id);
-        if (uItem) {
-          uItem.quantity += gItem.quantity;
-        } else {
-          mockCartMemory[userId].push({ ...gItem, user_id: userId });
-        }
-      }
-      delete mockCartMemory[session_id];
-    }
-
     // 3. Return final merged user cart
     const { data: finalItems } = await supabase
       .from('cart_items')
@@ -387,7 +356,7 @@ export const mergeCart = async (req: Request, res: Response) => {
 
     return res.json({
       success: true,
-      items: finalItems || mockCartMemory[userId] || [],
+      items: finalItems || [],
       message: 'Cart merged successfully'
     });
   } catch (err: any) {
