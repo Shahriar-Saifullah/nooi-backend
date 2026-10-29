@@ -42,6 +42,11 @@ import {
   listSupportTickets, getSupportTicket, replySupportTicket, setSupportStatus,
   getPlatformSettings, updatePlatformSettings, getPaymentStatus, getMe, updateMe, changeMyPassword, getOpsCounts,
 } from '../controllers/ops.controller';
+import {
+  listModels, getModelProduct, generateModel, uploadModel,
+  approveModelJob, rejectModelJob, cancelModelJob, removeModel, setModelSize, rotateModel,
+} from '../controllers/models.controller';
+import multer from 'multer';
 import { validate } from '../middleware/validate';
 import {
   updateVendorStatusSchema,
@@ -107,6 +112,19 @@ router.post('/payouts/:id/refresh', requireAdmin, refreshPayout);
 router.get('/listings',                 requireAdmin, listListings);
 router.get('/listings/:id',             requireAdmin, getListing);
 router.post('/listings/:id/decision',   requireAdmin, decideListing);
+
+// 3D models for listings
+const glbUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 60 * 1024 * 1024 } });
+router.get('/models',                         requireAdmin, listModels);
+router.get('/models/products/:id',            requireAdmin, getModelProduct);
+router.post('/models/products/:id/generate',  requireAdmin, generateModel);
+router.post('/models/products/:id/upload',    requireAdmin, glbUpload.single('file'), uploadModel);
+router.post('/models/products/:id/remove',    requireAdmin, removeModel);
+router.post('/models/products/:id/size',      requireAdmin, setModelSize);
+router.post('/models/rotate',                  requireAdmin, rotateModel);
+router.post('/models/jobs/:id/approve',       requireAdmin, approveModelJob);
+router.post('/models/jobs/:id/reject',        requireAdmin, rejectModelJob);
+router.post('/models/jobs/:id/cancel',        requireAdmin, cancelModelJob);
 
 // Cancellation requests
 router.get('/cancellations',              requireAdmin, listCancellations);
