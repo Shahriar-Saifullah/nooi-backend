@@ -45,7 +45,7 @@ function shapeForGrid(row: any) {
     shop_group: row.furniture_types?.shop_group ?? 'Other',
     type_name: row.furniture_types?.name ?? null,
     /** True when a placed 3D model maps to this product. Drives the badge. */
-    is_3d: Boolean(row.canvas_model_id),
+    is_3d: Boolean(row.canvas_model_id || row.specs_json?.model_url),
     in_stock: inStock,
     retailer: retailer.id ? retailer : null,
     variants,
@@ -343,7 +343,11 @@ export const addProductReview = async (req: Request, res: Response) => {
 export const getCanvasProductLink = async (req: Request, res: Response) => {
   try {
     const { canvasModelId } = req.params;
- 
+    // A vendor listing placed from the canvas "Shop" tab is "shop:<productId>"
+    // — the exact product, not a lookalike.
+    const shopProductId = String(canvasModelId).startsWith('shop:') ? String(canvasModelId).slice(5) : null;
+    if (shopProductId !== null && !UUID_RE.test(shopProductId)) return res.json({ success: true, products: [] });
+
     const { data, error } = await supabase
       .from('products')
       .select(
@@ -354,7 +358,7 @@ export const getCanvasProductLink = async (req: Request, res: Response) => {
          retailers(id, name, logo_url, shipping_policy_json),
          product_variants(*)`,
       )
-      .eq('canvas_model_id', canvasModelId)
+      .eq(shopProductId ? 'id' : 'canvas_model_id', shopProductId ?? canvasModelId)
       .eq('listing_status', 'approved');
  
     if (error) {
@@ -372,6 +376,72 @@ export const getCanvasProductLink = async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('[canvas-link] threw:', err);
     return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DEFAULT_SIZE = { w: 100, d: 80, h: 80 };
+
+/** A variant's real size in cm, if the vendor gave a sensible one. */
+function sizeOf(variants: any[]): { w: number; d: number; h: number } | null {
+  for (const v of variants) {
+    const d = v?.dimensions_cm;
+    const w = Number(d?.width), dep = Number(d?.depth), h = Number(d?.height);
+    if ([w, dep, h].every(n => Number.isFinite(n) && n > 0 && n <= 2000)) return { w, d: dep, h };
+  }
+  return null;
+}
+
+/**
+ * GET /marketplace/canvas-items?search=   approved listings with a 3D model
+ * GET /marketplace/canvas-items?ids=a,b   specific listings (rooms that contain them)
+ *
+ * What the canvas "Shop" tab drags into a room. By id it also returns listings
+ * that have since gone off sale, so a saved room still shows what it contains.
+ */
+export const getCanvasItems = async (req: Request, res: Response) => {
+  try {
+    const ids = String(req.query.ids || '').split(',').map(s => s.trim()).filter(s => UUID_RE.test(s)).slice(0, 100);
+    const search = String(req.query.search || '').trim().slice(0, 80).replace(/[%,()]/g, ' ');
+
+    let q = supabase.from('products')
+      .select(`id, title, category, type_id, tags, base_price, listing_status, specs_json, created_at,
+               retailers ( name ), product_variants ( price, images, dimensions_cm, is_active )`)
+      .not('specs_json->>model_url', 'is', null);
+    if (ids.length) {
+      q = q.in('id', ids);
+    } else {
+      q = q.eq('listing_status', 'approved').order('created_at', { ascending: false }).limit(60);
+      if (search) q = q.ilike('title', `%${search}%`);
+    }
+    const { data, error } = await q;
+    if (error) return res.status(500).json({ success: false, error: error.message });
+
+    const items = (data ?? []).map((p: any) => {
+      const variants = (p.product_variants ?? []).filter((v: any) => v.is_active !== false);
+      const prices = variants.map((v: any) => Number(v.price)).filter((n: number) => Number.isFinite(n));
+      const photo = variants.flatMap((v: any) => v.images ?? [])
+        .find((u: unknown) => typeof u === 'string' && /^https?:\/\//.test(u) && !u.includes('picsum.photos')) ?? null;
+      const size = sizeOf(variants);
+      return {
+        product_id: p.id,
+        title: p.title,
+        vendor: p.retailers?.name ?? null,
+        price: prices.length ? Math.min(...prices) : Number(p.base_price),
+        photo,
+        model_url: p.specs_json.model_url,
+        size: size ?? DEFAULT_SIZE,
+        size_known: Boolean(size),
+        type_id: p.type_id,
+        category: p.category,
+        tags: p.tags ?? [],
+        on_sale: p.listing_status === 'approved' && variants.length > 0,
+      };
+    });
+    return res.json({ success: true, items });
+  } catch (err: any) {
+    console.error('[canvas-items] threw:', err);
+    return res.status(500).json({ success: false, error: err.message });
   }
 };
 

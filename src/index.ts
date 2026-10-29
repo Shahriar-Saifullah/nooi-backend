@@ -19,6 +19,7 @@ import sharedRoutes         from './routes/shared.routes';
 import notificationRoutes   from './routes/notifications.routes';
 import supportRoutes        from './routes/support.routes';
 import { errorHandler }     from './middleware/errorHandler';
+import { startModelWorker } from './services/model3d';
 import { stripeWebhookHandler, moyasarWebhookHandler } from './controllers/orders.controller';
 
 const app = express();
@@ -71,6 +72,7 @@ if (process.env.NODE_ENV !== 'test') {
   app.listen(PORT, () => {
     console.log(`Nooi backend running on port ${PORT}`);
   });
+  startModelWorker();
 }
 
 export default app;

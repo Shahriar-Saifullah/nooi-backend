@@ -12,6 +12,7 @@ import { AuthRequest } from '../types';
 import { money, activeProvider } from '../services/payments';
 import { cancelWholeOrder, cancelShipment, shipmentRefundAmount } from '../services/cancellation.service';
 import { getSettings, validateSettingsPatch, clearSettingsCache } from '../services/settings.service';
+import { autoQueueOnApprove } from '../services/model3d';
 
 const clean = (v: unknown, max: number) => String(v ?? '').trim().slice(0, max);
 
@@ -107,7 +108,7 @@ export async function decideListing(req: AuthRequest, res: Response) {
         reviewed_at: now,
       })
       .eq('id', id).in('listing_status', rule.from)
-      .select('id, title, listing_status, retailers ( vendor_id )').maybeSingle();
+      .select('id, title, listing_status, specs_json, retailers ( vendor_id )').maybeSingle();
     if (error) return res.status(400).json({ success: false, error: error.message });
     if (!updated) {
       const { data: cur } = await supabase.from('products').select('listing_status').eq('id', id).maybeSingle();
@@ -125,6 +126,8 @@ export async function decideListing(req: AuthRequest, res: Response) {
       'listing',
       '/sell/products',
     );
+    // Approved listings without a 3D model go into the 3D queue (/admin/models).
+    if (action === 'approve') await autoQueueOnApprove(id, (updated as any).specs_json, req.user?.id);
     return res.json({ success: true, data: { listing_status: rule.to }, message: `Listing ${rule.verb}` });
   } catch (err) {
     console.error('decideListing error:', err);
@@ -465,10 +468,11 @@ export async function changeMyPassword(req: AuthRequest, res: Response) {
 
 /** Counts for the dashboard / sidebar badges. GET /admin/ops/counts */
 export async function getOpsCounts(_req: AuthRequest, res: Response) {
-  const [l, c, s] = await Promise.all([
+  const [l, c, s, m] = await Promise.all([
     supabase.from('products').select('id', { count: 'exact', head: true }).eq('listing_status', 'pending'),
     supabase.from('order_cancellation_requests').select('id', { count: 'exact', head: true }).in('status', ['requested', 'processing']),
     supabase.from('support_tickets').select('id', { count: 'exact', head: true }).eq('status', 'open'),
+    supabase.from('product_model_jobs').select('id', { count: 'exact', head: true }).eq('status', 'review'),
   ]);
-  return res.json({ success: true, data: { listings: l.count || 0, cancellations: c.count || 0, support: s.count || 0 } });
+  return res.json({ success: true, data: { listings: l.count || 0, cancellations: c.count || 0, support: s.count || 0, models: m.count || 0 } });
 }
