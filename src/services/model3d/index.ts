@@ -13,6 +13,7 @@ import { supabase } from '../supabase';
 import { activeModelProvider, VIEWS, type SourceImage, type View } from './providers';
 import { ProviderError } from './tripo';
 import { optimizeGlb, turnToFrontDeg } from './optimize';
+import { notifyAdmins, links } from '../notifications.service';
 
 export { activeModelProvider, VIEWS };
 export type { SourceImage, View };
@@ -230,6 +231,7 @@ async function step(job: any) {
       await setJob(job.id, { progress: r.progress, next_poll_at: later(POLL_EVERY_MS) });
     } else if (r.state === 'failed') {
       await setJob(job.id, { status: 'failed', error: r.error });
+      await notifyJob(job, '3D model failed', r.error);
     } else {
       const stored = await storeGlbFromUrl(job.product_id, job.id, r.glbUrl, provider.forwardAxis?.());
       await setJob(job.id, {
@@ -237,6 +239,7 @@ async function step(job: any) {
         glb_url: stored.url, glb_path: stored.path, glb_bytes: stored.bytes,
         ...(r.credits ? { credits_used: r.credits } : {}),
       });
+      await notifyJob(job, '3D model ready to review', 'Check it against the photos and approve it onto the listing.');
     }
   } catch (e: any) {
     if (e instanceof ProviderError && e.permanent) {
@@ -246,6 +249,12 @@ async function step(job: any) {
     // A network blip shouldn't fail a job that may be fine on the provider.
     await setJob(job.id, { error: e?.message || 'Poll failed', next_poll_at: later(e?.waitMs || 60_000) });
   }
+}
+
+/** Admins hear when a model is ready for review or failed. */
+async function notifyJob(job: any, title: string, message: string) {
+  const { data: p } = await supabase.from('products').select('title').eq('id', job.product_id).maybeSingle();
+  await notifyAdmins({ title: `${title}: ${p?.title ?? 'a listing'}`, message, type: 'admin', link: links.admin('models', job.product_id) });
 }
 
 let running = false;

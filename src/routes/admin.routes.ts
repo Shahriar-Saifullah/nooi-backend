@@ -47,6 +47,7 @@ import {
   approveModelJob, rejectModelJob, cancelModelJob, removeModel, setModelSize, rotateModel,
 } from '../controllers/models.controller';
 import multer from 'multer';
+import { acceptPhotos } from '../services/supportAttachments.service';
 import { validate } from '../middleware/validate';
 import {
   updateVendorStatusSchema,
@@ -135,7 +136,7 @@ router.post('/cancellations/:id/decline', requireAdmin, declineCancellation);
 // Support tickets
 router.get('/support',              requireAdmin, listSupportTickets);
 router.get('/support/:id',          requireAdmin, getSupportTicket);
-router.post('/support/:id/reply',   requireAdmin, replySupportTicket);
+router.post('/support/:id/reply',   requireAdmin, acceptPhotos, replySupportTicket);
 router.post('/support/:id/status',  requireAdmin, setSupportStatus);
 
 // Settings and my account

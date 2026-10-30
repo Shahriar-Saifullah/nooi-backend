@@ -1107,7 +1107,7 @@ ${JSON.stringify(catalog)}
 EXISTING FURNITURE ALREADY PLACED (do not overlap these):
 ${JSON.stringify(existing ?? [])}
 
-TASK: Identify which room the user means (match names loosely — "master bedroom" matches "MASTER BED RM"). Choose 4-10 appropriate catalog items for that room type and the user's wishes, and lay them out realistically:
+TASK: Identify which room the user means (match names loosely — "master bedroom" matches "MASTER BED RM"). Choose 4-10 appropriate catalog items for that room type and the user's wishes — a complete, coherent set sized for the room (for a bedroom: one bed that fits, two nightstands for a double/king bed, a wardrobe and/or dresser, a rug, then optional extras like a chair or lamp; leave out pieces that would not fit). Your positions are treated as suggestions — the app finalises exact placement against the walls and doors — but lay them out realistically:
 - beds centered against a wall, nightstands flanking the bed
 - wardrobes/dressers/bookshelves/TV stands flat against walls
 - sofas facing coffee tables/TV, rug under or in front of seating

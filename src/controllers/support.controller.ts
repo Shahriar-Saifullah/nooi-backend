@@ -10,13 +10,15 @@
  *
  * Routes (mounted at /support, all requireAuth):
  *   GET  /tickets                list my tickets
- *   POST /tickets                { subject, category, order_id?, body }
+ *   POST /tickets                { subject, category, order_id?, body } (+ photos[], multipart)
  *   GET  /tickets/:id            ticket + messages (marks read)
- *   POST /tickets/:id/messages   { body }
+ *   POST /tickets/:id/messages   { body } (+ photos[], multipart; body optional with photos)
  */
 
 import { Response } from 'express';
 import { supabase } from '../services/supabase';
+import { notify, notifyAdmins, links } from '../services/notifications.service';
+import { storeTicketPhotos, removeTicketPhotos, withSignedPhotos, AttachmentError, type Attachment } from '../services/supportAttachments.service';
 import { AuthRequest } from '../types';
 
 export const SUPPORT_CATEGORIES = ['order', 'payment', 'return', 'listing', 'payout', 'account', 'general'] as const;
@@ -46,6 +48,7 @@ export async function createTicket(req: AuthRequest, res: Response) {
     const orderId = typeof req.body?.order_id === 'string' && req.body.order_id ? req.body.order_id : null;
     if (subject.length < 3) return res.status(400).json({ success: false, error: 'Add a short subject.' });
     if (body.length < 5) return res.status(400).json({ success: false, error: 'Tell us a bit more about the problem.' });
+    const files = (req as any).files as Express.Multer.File[] | undefined;
 
     if (orderId) {
       // Customers may link their own orders; vendors, orders that include their goods.
@@ -68,13 +71,26 @@ export async function createTicket(req: AuthRequest, res: Response) {
     }).select('id, number').single();
     if (error) return res.status(400).json({ success: false, error: error.message });
 
+    let attachments: Attachment[] = [];
+    try {
+      attachments = await storeTicketPhotos(ticket.id, files);
+    } catch (e: any) {
+      await supabase.from('support_tickets').delete().eq('id', ticket.id);
+      return res.status(e instanceof AttachmentError ? 400 : 500).json({ success: false, error: e?.message || 'Upload failed' });
+    }
     const { error: mErr } = await supabase.from('support_messages').insert({
-      ticket_id: ticket.id, author_id: userId, author_role: requesterRole(req), body,
+      ticket_id: ticket.id, author_id: userId, author_role: requesterRole(req), body, attachments,
     });
     if (mErr) {
+      await removeTicketPhotos(attachments);
       await supabase.from('support_tickets').delete().eq('id', ticket.id);
       return res.status(400).json({ success: false, error: mErr.message });
     }
+    await notifyAdmins({
+      title: `New ${requesterRole(req)} ticket #${ticket.number}`,
+      message: `${subject}: ${body.slice(0, 200)}${attachments.length ? ` (${attachments.length} photo${attachments.length === 1 ? '' : 's'})` : ''}`,
+      type: 'admin', link: links.admin('support', ticket.id),
+    });
     return res.status(201).json({ success: true, data: { ticket }, message: `Ticket #${ticket.number} opened` });
   } catch (err) {
     console.error('createTicket error:', err);
@@ -87,28 +103,45 @@ export async function getMyTicket(req: AuthRequest, res: Response) {
     .select('*, orders ( order_number )').eq('id', req.params.id as string).eq('created_by', req.user!.id).maybeSingle();
   if (!ticket) return res.status(404).json({ success: false, error: 'Ticket not found' });
   const { data: messages } = await supabase.from('support_messages')
-    .select('id, author_role, body, created_at').eq('ticket_id', ticket.id).order('created_at');
+    .select('id, author_role, body, attachments, created_at').eq('ticket_id', ticket.id).order('created_at');
   if (ticket.requester_unread) {
     await supabase.from('support_tickets').update({ requester_unread: false }).eq('id', ticket.id);
   }
-  return res.json({ success: true, data: { ticket, messages: messages || [] } });
+  return res.json({ success: true, data: { ticket, messages: await withSignedPhotos(messages || []) } });
 }
 
 export async function replyToMyTicket(req: AuthRequest, res: Response) {
   const body = clean(req.body?.body, 5000);
-  if (!body) return res.status(400).json({ success: false, error: 'Write a message first.' });
+  const files = (req as any).files as Express.Multer.File[] | undefined;
+  if (!body && !files?.length) return res.status(400).json({ success: false, error: 'Write a message or add a photo.' });
   const { data: ticket } = await supabase.from('support_tickets')
-    .select('id').eq('id', req.params.id as string).eq('created_by', req.user!.id).maybeSingle();
+    .select('id, number, subject, assigned_to').eq('id', req.params.id as string).eq('created_by', req.user!.id).maybeSingle();
   if (!ticket) return res.status(404).json({ success: false, error: 'Ticket not found' });
 
+  let attachments: Attachment[] = [];
+  try {
+    attachments = await storeTicketPhotos(ticket.id, files);
+  } catch (e: any) {
+    return res.status(e instanceof AttachmentError ? 400 : 500).json({ success: false, error: e?.message || 'Upload failed' });
+  }
   const { error } = await supabase.from('support_messages').insert({
-    ticket_id: ticket.id, author_id: req.user!.id, author_role: requesterRole(req), body,
+    ticket_id: ticket.id, author_id: req.user!.id, author_role: requesterRole(req), body, attachments,
   });
-  if (error) return res.status(400).json({ success: false, error: error.message });
+  if (error) {
+    await removeTicketPhotos(attachments);
+    return res.status(400).json({ success: false, error: error.message });
+  }
   const now = new Date().toISOString();
   // A reply always puts the ticket back with Nooi, including a resolved one.
   await supabase.from('support_tickets').update({
     status: 'open', admin_unread: true, last_message_at: now, updated_at: now,
   }).eq('id', ticket.id);
+  // The admin handling it, or the whole team if nobody has picked it up yet.
+  const n = {
+    title: `Reply on ticket #${ticket.number}`,
+    message: `${ticket.subject}: ${body ? body.slice(0, 200) : `sent ${attachments.length} photo${attachments.length === 1 ? '' : 's'}`}`,
+    type: 'admin' as const, link: links.admin('support', ticket.id),
+  };
+  if (ticket.assigned_to) await notify(ticket.assigned_to, n); else await notifyAdmins(n);
   return res.json({ success: true });
 }

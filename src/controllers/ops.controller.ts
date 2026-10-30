@@ -13,6 +13,8 @@ import { money, activeProvider } from '../services/payments';
 import { cancelWholeOrder, cancelShipment, shipmentRefundAmount } from '../services/cancellation.service';
 import { getSettings, validateSettingsPatch, clearSettingsCache } from '../services/settings.service';
 import { autoQueueOnApprove } from '../services/model3d';
+import { storeTicketPhotos, removeTicketPhotos, withSignedPhotos, AttachmentError, type Attachment } from '../services/supportAttachments.service';
+import { notify as notifyUser, notifyOrderVendors, links, type NotificationType } from '../services/notifications.service';
 
 const clean = (v: unknown, max: number) => String(v ?? '').trim().slice(0, max);
 
@@ -23,9 +25,10 @@ async function audit(req: AuthRequest, action: string, entityType: string, entit
   });
 }
 
-async function notify(userId: string | null | undefined, title: string, message: string, type: string, link?: string) {
-  if (!userId) return;
-  await supabase.from('notifications').insert({ user_id: userId, title, message, type, link_url: link ?? null });
+/** Through the notifications service, so people's switches are respected
+ *  (unless `essential`). */
+async function notify(userId: string | null | undefined, title: string, message: string, type: string, link?: string, essential = false) {
+  await notifyUser(userId, { title, message, type: type as NotificationType, link: link ?? null, essential });
 }
 
 const isSuper = (req: AuthRequest) => req.userProfile?.role === 'super_admin';
@@ -125,6 +128,7 @@ export async function decideListing(req: AuthRequest, res: Response) {
       rule.to === 'approved' ? 'Your listing is now on sale in the Nooi marketplace.' : note,
       'listing',
       '/sell/products',
+      true,
     );
     // Approved listings without a 3D model go into the 3D queue (/admin/models).
     if (action === 'approve') await autoQueueOnApprove(id, (updated as any).specs_json, req.user?.id);
@@ -236,10 +240,17 @@ export async function approveCancellation(req: AuthRequest, res: Response) {
       result.amount > 0
         ? `We've refunded ${money(result.amount, order?.currency)}. It usually reaches your account within five working days.`
         : 'Your order has been cancelled.',
-      'order_status', `/orders/${r.order_id}`);
+      'order_status', `/orders/${r.order_id}`, true);
     if (r.requester_role === 'vendor') {
       await notify(r.requested_by, `Cancellation approved for ${order?.order_number}`,
-        'The customer has been refunded and the order removed from your list.', 'order_status', '/sell/orders');
+        'The customer has been refunded and the order removed from your list.', 'order_status', links.vendorOrder(order?.order_number), true);
+    } else {
+      // The customer asked: every vendor on the order must stop work on it.
+      await notifyOrderVendors(r.order_id, num => ({
+        title: `Order ${num} was cancelled — don't ship it`,
+        message: 'The customer cancelled before dispatch and has been refunded.',
+        type: 'cancellation', link: links.vendorOrder(num), essential: true,
+      }));
     }
     return res.json({ success: true, data: { refunded: result.amount, refund_id: result.refundId }, message: `Cancelled${amountText}` });
   } catch (err) {
@@ -264,7 +275,15 @@ export async function declineCancellation(req: AuthRequest, res: Response) {
   const { data: order } = await supabase.from('orders').select('order_number').eq('id', r.order_id).maybeSingle();
   await audit(req, 'cancellation.declined', 'order', r.order_id, `Declined cancellation of ${order?.order_number}: ${note.slice(0, 140)}`);
   await notify(r.requested_by, `Cancellation of ${order?.order_number} declined`, note, 'order_status',
-    r.requester_role === 'vendor' ? '/sell/orders' : `/orders/${r.order_id}`);
+    r.requester_role === 'vendor' ? links.vendorOrder(order?.order_number) : `/orders/${r.order_id}`, true);
+  if (r.requester_role === 'customer') {
+    // Vendors were told to hold this order when the request came in.
+    await notifyOrderVendors(r.order_id, num => ({
+      title: `Order ${num} goes ahead`,
+      message: 'Nooi declined the customer\'s cancellation request. Please prepare and ship as normal.',
+      type: 'cancellation', link: links.vendorOrder(num), essential: true,
+    }));
+  }
   return res.json({ success: true, message: 'Request declined' });
 }
 
@@ -313,7 +332,7 @@ export async function getSupportTicket(req: AuthRequest, res: Response) {
     .select('*, orders ( id, order_number, status, total_amount, currency )').eq('id', req.params.id as string).maybeSingle();
   if (!ticket) return res.status(404).json({ success: false, error: 'Ticket not found' });
   const [{ data: messages }, { data: person }] = await Promise.all([
-    supabase.from('support_messages').select('id, author_id, author_role, body, created_at').eq('ticket_id', ticket.id).order('created_at'),
+    supabase.from('support_messages').select('id, author_id, author_role, body, attachments, created_at').eq('ticket_id', ticket.id).order('created_at'),
     supabase.from('profiles').select('full_name, role').eq('id', ticket.created_by).maybeSingle(),
   ]);
   let email: string | null = null;
@@ -321,7 +340,7 @@ export async function getSupportTicket(req: AuthRequest, res: Response) {
   if (ticket.admin_unread) await supabase.from('support_tickets').update({ admin_unread: false }).eq('id', ticket.id);
   return res.json({
     success: true,
-    data: { ticket, messages: messages || [], requester: { name: person?.full_name ?? null, role: person?.role ?? null, email } },
+    data: { ticket, messages: await withSignedPhotos(messages || []), requester: { name: person?.full_name ?? null, role: person?.role ?? null, email } },
   });
 }
 
@@ -329,22 +348,32 @@ export async function getSupportTicket(req: AuthRequest, res: Response) {
 export async function replySupportTicket(req: AuthRequest, res: Response) {
   const body = clean(req.body?.body, 5000);
   const status = ['waiting', 'resolved'].includes(req.body?.status) ? req.body.status : 'waiting';
-  if (!body) return res.status(400).json({ success: false, error: 'Write a reply first.' });
+  const files = (req as any).files as Express.Multer.File[] | undefined;
+  if (!body && !files?.length) return res.status(400).json({ success: false, error: 'Write a reply or add a photo.' });
   const { data: ticket } = await supabase.from('support_tickets')
     .select('id, number, subject, created_by, requester_role').eq('id', req.params.id as string).maybeSingle();
   if (!ticket) return res.status(404).json({ success: false, error: 'Ticket not found' });
 
+  let attachments: Attachment[] = [];
+  try {
+    attachments = await storeTicketPhotos(ticket.id, files);
+  } catch (e: any) {
+    return res.status(e instanceof AttachmentError ? 400 : 500).json({ success: false, error: e?.message || 'Upload failed' });
+  }
   const { error } = await supabase.from('support_messages').insert({
-    ticket_id: ticket.id, author_id: req.user!.id, author_role: 'admin', body,
+    ticket_id: ticket.id, author_id: req.user!.id, author_role: 'admin', body, attachments,
   });
-  if (error) return res.status(400).json({ success: false, error: error.message });
+  if (error) {
+    await removeTicketPhotos(attachments);
+    return res.status(400).json({ success: false, error: error.message });
+  }
   const now = new Date().toISOString();
   await supabase.from('support_tickets').update({
     status, requester_unread: true, admin_unread: false, last_message_at: now, updated_at: now,
     assigned_to: req.user!.id,
   }).eq('id', ticket.id);
-  await notify(ticket.created_by, `Reply on ticket #${ticket.number}`, body.slice(0, 200), 'support',
-    ticket.requester_role === 'vendor' ? '/sell/support' : `/support?ticket=${ticket.id}`);
+  await notify(ticket.created_by, `Reply on ticket #${ticket.number}`, body ? body.slice(0, 200) : 'Nooi sent you a photo.', 'support',
+    ticket.requester_role === 'vendor' ? links.vendorSupport(ticket.id) : links.support(ticket.id));
   return res.json({ success: true });
 }
 

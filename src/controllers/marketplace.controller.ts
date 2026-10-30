@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { supabase } from '../services/supabase';
+import { notify, vendorIdForRetailer, links } from '../services/notifications.service';
 
 const DEFAULT_LEAD_TIME_DAYS = 14;
  
@@ -326,13 +327,18 @@ export const addProductReview = async (req: Request, res: Response) => {
       .select()
       .single();
 
+    // A failed save used to answer "success" with a made-up review, so the
+    // shopper thought it was posted when it wasn't.
     if (error) {
-      return res.json({
-        success: true,
-        review: { id: `rev-${Date.now()}`, product_id: id, user_name: userName, rating, comment, created_at: new Date().toISOString() },
-        is_mock: true
-      });
+      return res.status(400).json({ success: false, message: 'Could not save your review. Please try again.' });
     }
+
+    const { data: product } = await supabase.from('products').select('title, retailer_id').eq('id', id as string).maybeSingle();
+    await notify(await vendorIdForRetailer(product?.retailer_id), {
+      title: `New ${Number(rating)}★ review on ${product?.title ?? 'your product'}`,
+      message: comment ? String(comment).slice(0, 300) : 'A shopper left a rating without a comment.',
+      type: 'review', link: links.vendorProducts,
+    });
 
     return res.json({ success: true, review: data });
   } catch (err: any) {

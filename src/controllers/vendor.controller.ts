@@ -4,6 +4,7 @@ import { AuthRequest } from '../types';
 import { releaseEarnings } from '../services/payments/earnings.service';
 import { fromMinor, maskIban, normaliseSaudiIban, summarise } from '../services/payments/ledger';
 import { payoutHoldDays } from '../services/payments';
+import { notify, notifyAdmins, links } from '../services/notifications.service';
 import { UpdateVendorProfileInput } from '../schemas/auth.schema';
 
 export async function getVendorProfile(req: AuthRequest, res: Response) {
@@ -451,6 +452,10 @@ export async function dispatchShipment(req: AuthRequest, res: Response) {
       timestamp: new Date().toISOString(),
     });
 
+    await notifyCustomerOfShipment(updated.order_id, updated.retailer_id, 'in_transit', {
+      carrier: CARRIERS[carrier].name, tracking,
+    });
+
     return res.status(200).json({
       success: true,
       data: updated,
@@ -548,6 +553,8 @@ export async function advanceShipmentStatus(req: AuthRequest, res: Response) {
       description: note ? String(note).slice(0, 200) : `Marked ${target.replace(/_/g, ' ')} by vendor`,
       timestamp: new Date().toISOString(),
     });
+
+    await notifyCustomerOfShipment(current.order_id, current.retailer_id, target);
 
     return res.status(200).json({
       success: true,
@@ -687,6 +694,14 @@ export async function saveVendorPayoutAccount(req: AuthRequest, res: Response) {
     const { error } = await supabase.from('vendor_payout_accounts').upsert(row, { onConflict: 'vendor_id' });
     if (error) return res.status(400).json({ success: false, error: error.message });
     await supabase.from('vendor_profiles').update({ payout_connected: Boolean(row.verified_at) }).eq('id', vendorId);
+    if (!row.verified_at) {
+      const { data: vp } = await supabase.from('vendor_profiles').select('store_name, business_name').eq('id', vendorId).maybeSingle();
+      await notifyAdmins({
+        title: 'Bank account to verify',
+        message: `${vp?.store_name || vp?.business_name || 'A vendor'} added a payout account (${maskIban(iban)}). Check it against their documents before the next payout.`,
+        type: 'admin', link: links.admin('payouts'),
+      });
+    }
 
     return res.json({
       success: true,
@@ -696,5 +711,48 @@ export async function saveVendorPayoutAccount(req: AuthRequest, res: Response) {
   } catch (err) {
     console.error('saveVendorPayoutAccount error:', err);
     return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+/**
+ * Tell the customer their shipment moved: shipped (with tracking), out for
+ * delivery, delivered. Also used when Nooi confirms a delivery by hand.
+ */
+export async function notifyCustomerOfShipment(
+  orderId: string, retailerId: string, status: string,
+  extra: { carrier?: string; tracking?: string; byNooi?: boolean } = {},
+) {
+  try {
+    const [{ data: order }, { data: retailer }] = await Promise.all([
+      supabase.from('orders').select('order_number, user_id').eq('id', orderId).maybeSingle(),
+      supabase.from('retailers').select('name').eq('id', retailerId).maybeSingle(),
+    ]);
+    if (!order?.user_id) return;
+    const from = retailer?.name ? ` from ${retailer.name}` : '';
+    const msg: Record<string, { title: string; message: string }> = {
+      label_created: {
+        title: `Your items${from} are being packed`,
+        message: `Part of order ${order.order_number} is being prepared for shipping.`,
+      },
+      in_transit: {
+        title: `Your items${from} have shipped`,
+        message: extra.carrier
+          ? `Order ${order.order_number} is on its way with ${extra.carrier}${extra.tracking ? ` — tracking ${extra.tracking}` : ''}.`
+          : `Order ${order.order_number} is on its way.`,
+      },
+      out_for_delivery: {
+        title: `Out for delivery today${from}`,
+        message: `Part of order ${order.order_number} is out for delivery. Someone should be available to receive it.`,
+      },
+      delivered: {
+        title: `Delivered${from}`,
+        message: `Part of order ${order.order_number} has been delivered${extra.byNooi ? ' (confirmed by Nooi)' : ''}. If anything is wrong, you can request a return from the order page.`,
+      },
+    };
+    const m = msg[status];
+    if (!m) return;
+    await notify(order.user_id, { ...m, type: 'shipment', link: links.order(orderId) });
+  } catch (e: any) {
+    console.warn('[notify] shipment notification failed:', e?.message || e);
   }
 }
