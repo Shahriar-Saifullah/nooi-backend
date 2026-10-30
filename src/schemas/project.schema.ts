@@ -162,12 +162,18 @@ export const aiFurnishSchema = z.object({
     w: z.number(),   // footprint cm
     d: z.number(),
     h: z.number().optional(),   // height cm — flat items (rugs) skip collision
-  })).min(1).max(80),
+    // Real products (shop mode): the price the shopper would pay, and who sells it
+    price: z.number().nonnegative().optional(),
+    vendor: z.string().max(120).optional(),
+  })).min(1).max(160),
   existing: z.array(z.object({
     name: z.string(),
     x: z.number(),
     z: z.number(),
   })).max(100).optional(),
+  /** Shop mode: the most the chosen products may cost together (checkout currency). */
+  budget: z.number().positive().max(10_000_000).optional(),
+  currency: z.string().max(8).optional(),
 });
 export type AiFurnishInput = z.infer<typeof aiFurnishSchema>;
 
