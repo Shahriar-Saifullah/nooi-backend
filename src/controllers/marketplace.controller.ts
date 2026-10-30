@@ -412,12 +412,13 @@ export const getCanvasItems = async (req: Request, res: Response) => {
 
     let q = supabase.from('products')
       .select(`id, title, category, type_id, tags, base_price, listing_status, specs_json, created_at,
-               retailers ( name ), product_variants ( price, images, dimensions_cm, is_active )`)
+               retailers ( name ), product_variants ( id, price, images, dimensions_cm, is_active, stock_quantity )`)
       .not('specs_json->>model_url', 'is', null);
     if (ids.length) {
       q = q.in('id', ids);
     } else {
-      q = q.eq('listing_status', 'approved').order('created_at', { ascending: false }).limit(60);
+      const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 60));
+      q = q.eq('listing_status', 'approved').order('created_at', { ascending: false }).limit(limit);
       if (search) q = q.ilike('title', `%${search}%`);
     }
     const { data, error } = await q;
@@ -429,6 +430,10 @@ export const getCanvasItems = async (req: Request, res: Response) => {
       const photo = variants.flatMap((v: any) => v.images ?? [])
         .find((u: unknown) => typeof u === 'string' && /^https?:\/\//.test(u) && !u.includes('picsum.photos')) ?? null;
       const size = sizeOf(variants);
+      // What "add to cart" buys: the cheapest variant in stock, else the cheapest.
+      const inStock = variants.filter((v: any) => Number(v.stock_quantity) > 0);
+      const pool = inStock.length ? inStock : variants;
+      const buy = pool.reduce((best: any, v: any) => (!best || Number(v.price) < Number(best.price) ? v : best), null);
       return {
         product_id: p.id,
         title: p.title,
@@ -442,6 +447,9 @@ export const getCanvasItems = async (req: Request, res: Response) => {
         category: p.category,
         tags: p.tags ?? [],
         on_sale: p.listing_status === 'approved' && variants.length > 0,
+        in_stock: inStock.length > 0,
+        variant_id: buy?.id ?? null,
+        variant_price: buy ? Number(buy.price) : null,
       };
     });
     return res.json({ success: true, items });

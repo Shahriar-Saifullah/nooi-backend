@@ -1073,16 +1073,21 @@ export async function aiFurnish(req: AuthRequest, res: Response) {
   try {
     const userId    = req.user!.id;
     const projectId = String(req.params.id);
-    const { command, rooms, catalog, existing } = req.body as {
+    const { command, rooms, catalog, existing, budget, currency } = req.body as {
       command: string;
       rooms: {
         id: string; name: string;
         rect: { x: number; z: number; w: number; d: number };
         polygon?: [number, number][];
       }[];
-      catalog: { id: string; name: string; category: string; w: number; d: number; h?: number }[];
+      catalog: { id: string; name: string; category: string; w: number; d: number; h?: number; price?: number; vendor?: string }[];
       existing?: { name: string; x: number; z: number }[];
+      budget?: number;
+      currency?: string;
     };
+    // Shop mode: the catalog is real products with prices.
+    const shopMode = catalog.some(c => typeof c.price === 'number');
+    const cur = (currency || 'SAR').toUpperCase();
 
     const project = await verifyOwnership(projectId, userId);
     if (!project) {
@@ -1101,8 +1106,12 @@ USER COMMAND: "${command}"
 ROOMS (world coordinates in meters; rect = {x: left edge, z: top edge, w: width along x, d: depth along z}; +x is right, +z is down when viewed from above):
 ${JSON.stringify(rooms)}
 
-AVAILABLE FURNITURE CATALOG (footprint in cm, w = width, d = depth):
+${shopMode
+  ? `AVAILABLE PRODUCTS — real items shoppers can buy (footprint in cm, w = width, d = depth; price in ${cur}):`
+  : 'AVAILABLE FURNITURE CATALOG (footprint in cm, w = width, d = depth):'}
 ${JSON.stringify(catalog)}
+${budget ? `BUDGET: the prices of everything you choose must add up to at most ${budget} ${cur}. Stay under it — choose fewer or cheaper pieces rather than exceed it, and spend it on the pieces that matter most for this room (the bed in a bedroom, the sofa in a living room) before extras.` : ''}
+${shopMode ? 'Each product exists once in the list; you may use a product more than once only where that makes sense (e.g. two nightstands, dining chairs). Use only ids from this list.' : ''}
 
 EXISTING FURNITURE ALREADY PLACED (do not overlap these):
 ${JSON.stringify(existing ?? [])}
@@ -1344,7 +1353,40 @@ If no room matches the command, respond: {"error": "<short explanation>"}`;
       accepted.push({ modelId: cat.id, x, z, rotation: rot, hw, hd, flat });
     }
 
-    const placements = accepted.map(({ modelId, x, z, rotation }) => ({ modelId, x, z, rotation }));
+    let kept = accepted;
+    let droppedForBudget = 0;
+    // The AI is asked to respect the budget; this makes sure it did. Extras go
+    // first (lamps, rugs, decor), then supporting pieces, then the anchor —
+    // and the most expensive within each tier.
+    if (budget && shopMode) {
+      const price = (id: string) => Number(catalogMap.get(id)?.price ?? 0);
+      const importance = (id: string) => {
+        const c = catalogMap.get(id);
+        const s = `${c?.name ?? ''} ${c?.category ?? ''}`.toLowerCase();
+        if (/\bbed\b|sofa|couch|sectional|dining table|desk/.test(s) && !/bedside|sofa table/.test(s)) return 3;
+        if (/wardrobe|dresser|nightstand|bedside|tv|armchair|chair|table|cabinet|bookcase|bookshelf/.test(s)) return 2;
+        return 1;
+      };
+      kept = [...accepted];
+      let total = kept.reduce((n, a) => n + price(a.modelId), 0);
+      while (total > budget && kept.length) {
+        const drop = [...kept].sort((a, b) => importance(a.modelId) - importance(b.modelId) || price(b.modelId) - price(a.modelId))[0];
+        kept = kept.filter(k => k !== drop);
+        total -= price(drop.modelId);
+        droppedForBudget++;
+      }
+      if (!kept.length) {
+        return res.status(422).json({
+          success: false,
+          error: `Nothing from the shop fits a budget of ${budget} ${cur} for this room — try a higher budget.`,
+        });
+      }
+    }
+
+    const placements = kept.map(({ modelId, x, z, rotation }) => ({ modelId, x, z, rotation }));
+    const totalPrice = shopMode
+      ? Number(placements.reduce((n, p) => n + Number(catalogMap.get(p.modelId)?.price ?? 0), 0).toFixed(2))
+      : null;
 
     if (placements.length === 0) {
       return res.status(422).json({ success: false, error: 'No suitable furniture fit that room - try a different request.' });
@@ -1357,6 +1399,9 @@ If no room matches the command, respond: {"error": "<short explanation>"}`;
         targetRoomName: room.name,
         message: typeof parsed.message === 'string' ? parsed.message : 'Furniture placed.',
         placements,
+        total_price: totalPrice,
+        currency: shopMode ? cur : null,
+        dropped_for_budget: droppedForBudget,
       },
     });
   } catch (err: any) {
