@@ -8,6 +8,8 @@ import { fromMinor, maskIban, summarise } from '../services/payments/ledger';
 import { supabase } from '../services/supabase';
 import { cancelWholeOrder } from '../services/cancellation.service';
 import { AuthRequest } from '../types';
+import { notify, notifyOrderVendors, vendorIdForRetailer, links } from '../services/notifications.service';
+import { notifyCustomerOfShipment } from './vendor.controller';
 import {
   UpdateVendorStatusInput,
   UpdateUserRoleInput,
@@ -155,6 +157,24 @@ export async function getVendorById(req: AuthRequest, res: Response) {
   }
 }
 
+/** What a vendor is told when their account status changes. */
+function vendorStatusNotice(status: string, reason?: string | null) {
+  if (status === 'approved') {
+    return { title: 'Your vendor account is approved', type: 'vendor_approval' as const, essential: true, link: links.vendorProducts,
+      message: 'You can now list products on Nooi. Add your first listing from your dashboard.' };
+  }
+  if (status === 'rejected') {
+    return { title: 'About your vendor application', type: 'vendor_approval' as const, essential: true, link: '/sell/not-approved',
+      message: String(reason || 'Your application was not approved.') };
+  }
+  if (status === 'suspended') {
+    return { title: 'Your vendor account has been suspended', type: 'vendor_approval' as const, essential: true, link: '/sell/support',
+      message: 'Your listings are hidden and you can\'t take new orders. Contact Nooi support for details.' };
+  }
+  return { title: 'Your vendor account was updated', type: 'vendor_approval' as const, essential: true, link: links.vendorDashboard,
+    message: `Your account status is now ${status}.` };
+}
+
 export async function updateVendorStatus(req: AuthRequest, res: Response) {
   try {
     const id = req.params.id as string;
@@ -182,6 +202,8 @@ export async function updateVendorStatus(req: AuthRequest, res: Response) {
     if (error) {
       return res.status(400).json({ success: false, error: error.message });
     }
+
+    await notify(id, vendorStatusNotice(status, updatePayload.rejection_reason));
 
     return res.status(200).json({
       success: true,
@@ -704,22 +726,7 @@ export async function decideVendorApplication(req: AuthRequest, res: Response) {
       metadata: { status, rejection_reason: rejection_reason || null },
     });
 
-    await supabase.from('notifications').insert({
-      user_id: id,
-      title:
-        status === 'approved'
-          ? 'Your vendor account is approved'
-          : status === 'rejected'
-            ? 'About your vendor application'
-            : 'Your vendor account has been suspended',
-      message:
-        status === 'approved'
-          ? 'You can now list products on Nooi. Open your vendor dashboard to add your first listing.'
-          : status === 'rejected'
-            ? String(rejection_reason)
-            : 'Your account has been suspended. Contact support for details.',
-      type: 'vendor_approval',
-    });
+    await notify(id, vendorStatusNotice(status, rejection_reason));
 
     return res.status(200).json({
       success: true,
@@ -1833,12 +1840,20 @@ export async function refundReturn(req: AuthRequest, res: Response) {
       metadata: { amount, refund_id: refundId, order_id: ret.order_id },
     });
 
-    await supabase.from('notifications').insert({
-      user_id: (await supabase.from('order_returns').select('user_id').eq('id', id).maybeSingle()).data?.user_id,
+    await notify((await supabase.from('order_returns').select('user_id').eq('id', id).maybeSingle()).data?.user_id, {
       title: 'Your refund is on its way',
       message: `We've refunded ${money(amount, order.currency)} for your return on ${order.order_number}. It usually reaches your account within five working days.`,
-      type: 'return',
+      type: 'return', link: links.order(ret.order_id), essential: true,
     });
+    {
+      const { data: oi } = await supabase.from('order_items')
+        .select('retailer_id, products ( title )').eq('id', ret.order_item_id).maybeSingle();
+      await notify(await vendorIdForRetailer((oi as any)?.retailer_id), {
+        title: `Return refunded on ${order.order_number}`,
+        message: `Nooi approved the return of ${(oi as any)?.products?.title ?? 'an item'} and refunded the customer. It has been taken out of your earnings; the customer sends the item back to you.`,
+        type: 'return', link: links.vendorReturns,
+      });
+    }
 
     const row: any = Array.isArray(settled) ? settled[0] : settled;
     return res.status(200).json({
@@ -1900,14 +1915,11 @@ export async function declineReturn(req: AuthRequest, res: Response) {
       metadata: { note },
     });
 
-    if (ret?.user_id) {
-      await supabase.from('notifications').insert({
-        user_id: ret.user_id,
-        title: 'About your return request',
-        message: note,
-        type: 'return',
-      });
-    }
+    await notify(ret?.user_id, {
+      title: 'About your return request',
+      message: note,
+      type: 'return', link: ret?.order_id ? links.order(ret.order_id) : null, essential: true,
+    });
 
     return res.status(200).json({
       success: true,
@@ -2132,6 +2144,21 @@ export async function overrideOrderStatus(req: AuthRequest, res: Response) {
       metadata: { status, note },
     });
 
+    {
+      const { data: o } = await supabase.from('orders').select('order_number, user_id').eq('id', id).maybeSingle();
+      const label: Record<string, string> = { paid: 'confirmed', processing: 'being prepared', fulfilled: 'complete' };
+      await notify(o?.user_id, {
+        title: `Order ${o?.order_number ?? ''} is ${label[status] ?? status}`,
+        message: note,
+        type: 'order_status', link: links.order(id),
+      });
+      await notifyOrderVendors(id, num => ({
+        title: `Nooi updated order ${num}`,
+        message: `Status set to ${status}: ${note}`,
+        type: 'order_status', link: links.vendorOrder(num),
+      }));
+    }
+
     return res.status(200).json({
       success: true,
       data: { status: row.final_status },
@@ -2179,16 +2206,18 @@ export async function cancelOrderAsAdmin(req: AuthRequest, res: Response) {
       metadata: { note, refund_amount: amount, refund_id: r.refundId },
     });
 
-    if (order?.user_id) {
-      await supabase.from('notifications').insert({
-        user_id: order.user_id,
-        title: `Order ${order.order_number} has been cancelled`,
-        message: amount > 0
-          ? `${note}\n\nWe've refunded ${money(amount, order.currency)}. It usually reaches your account within five working days.`
-          : note,
-        type: 'order_status',
-      });
-    }
+    await notify(order?.user_id, {
+      title: `Order ${order?.order_number} has been cancelled`,
+      message: amount > 0
+        ? `${note}\n\nWe've refunded ${money(amount, order?.currency)}. It usually reaches your account within five working days.`
+        : note,
+      type: 'order_status', link: links.order(id), essential: true,
+    });
+    await notifyOrderVendors(id, num => ({
+      title: `Order ${num} was cancelled — don't ship it`,
+      message: `Nooi cancelled this order and refunded the customer: ${note}`,
+      type: 'order_status', link: links.vendorOrder(num), essential: true,
+    }));
 
     return res.status(200).json({
       success: true,
@@ -2243,6 +2272,11 @@ export async function approveOrder(req: AuthRequest, res: Response) {
     }
     const { data: order } = await supabase.from('orders').select('order_number').eq('id', id).maybeSingle();
     await audit(req, 'order.approved', 'order', id, `Approved ${order?.order_number ?? id} for vendor payment`);
+    await notifyOrderVendors(id, num => ({
+      title: `Order ${num} approved for payment`,
+      message: 'Your earnings on this order become payable once your shipment is delivered (after the holding period).',
+      type: 'payout', link: links.vendorPayments,
+    }));
     return res.json({ success: true, data: { approved_at: row.approved_on }, message: 'Order approved' });
   } catch (err) {
     console.error('approveOrder error:', err);
@@ -2433,6 +2467,11 @@ export async function verifyVendorPayoutAccount(req: AuthRequest, res: Response)
   if (error) return res.status(400).json({ success: false, error: error.message });
   await supabase.from('vendor_profiles').update({ payout_connected: true }).eq('id', vendorId);
   await audit(req, 'vendor.payout_account_verified', 'vendor', vendorId, `Verified payout account ${maskIban(acct.iban)}`);
+  await notify(vendorId, {
+    title: 'Bank account verified',
+    message: `Payouts will be sent to ${maskIban(acct.iban)}.`,
+    type: 'payout', link: links.vendorPayments,
+  });
   return res.json({ success: true, message: 'Bank account verified' });
 }
 
@@ -2477,6 +2516,12 @@ export async function markShipmentDelivered(req: AuthRequest, res: Response) {
     const { data: order } = await supabase.from('orders').select('order_number').eq('id', orderId).maybeSingle();
     await audit(req, 'shipment.delivered', 'order', orderId,
       `Marked a shipment on ${order?.order_number ?? orderId} delivered: ${note.slice(0, 140)}`, { shipment_id: shipmentId, note });
+    await notifyCustomerOfShipment(orderId, s.retailer_id, 'delivered', { byNooi: true });
+    await notify(await vendorIdForRetailer(s.retailer_id), {
+      title: `Delivery confirmed for ${order?.order_number ?? 'an order'}`,
+      message: 'Nooi confirmed your shipment was delivered. Your earnings on it become payable after the holding period.',
+      type: 'shipment', link: links.vendorOrder(order?.order_number),
+    });
     return res.json({ success: true, message: 'Marked delivered' });
   } catch (err) {
     console.error('markShipmentDelivered error:', err);

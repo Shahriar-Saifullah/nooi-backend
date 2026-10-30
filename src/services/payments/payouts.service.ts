@@ -15,6 +15,8 @@ import { supabase } from '../supabase';
 import { moyasar, MoyasarError, MoyasarPayout } from './moyasar';
 import { payoutHoldDays } from './index';
 import { getSettings } from '../settings.service';
+import { notify, links } from '../notifications.service';
+import { fromMinor } from './ledger';
 
 export class PayoutError extends Error {
   status: number;
@@ -30,6 +32,7 @@ function claimErrorMessage(msg: string): PayoutError {
 }
 
 async function applyStatus(payoutId: string, p: Pick<MoyasarPayout, 'id' | 'status' | 'channel' | 'failure_reason' | 'message'>) {
+  const { data: before } = await supabase.from('vendor_payouts').select('status').eq('id', payoutId).maybeSingle();
   const { error } = await supabase.rpc('settle_vendor_payout', {
     p_payout_id: payoutId,
     p_status: p.status,
@@ -38,6 +41,30 @@ async function applyStatus(payoutId: string, p: Pick<MoyasarPayout, 'id' | 'stat
     p_failure_reason: p.failure_reason || (p.status === 'failed' ? p.message || null : null),
   });
   if (error) throw new Error(error.message);
+  if (before?.status !== p.status) await notifyPayout(payoutId, p.status, before?.status ?? null, p.failure_reason || p.message || null).catch(() => undefined);
+}
+
+/** Vendors hear when a payout is on its way, arrives, or bounces. */
+async function notifyPayout(payoutId: string, status: string, previous: string | null, reason: string | null) {
+  const { data: payout } = await supabase.from('vendor_payouts')
+    .select('vendor_id, amount_minor, status').eq('id', payoutId).maybeSingle();
+  if (!payout) return;
+  const amount = `SAR ${fromMinor(Number(payout.amount_minor || 0)).toFixed(2)}`;
+  const byStatus: Record<string, { title: string; message: string }> = {
+    queued:    { title: `Payout of ${amount} is on its way`, message: 'Nooi has sent your earnings to your bank. Transfers usually arrive within 1–2 working days.' },
+    initiated: { title: `Payout of ${amount} is on its way`, message: 'Nooi has sent your earnings to your bank. Transfers usually arrive within 1–2 working days.' },
+    paid:      { title: `Payout of ${amount} sent`, message: 'The bank transfer is complete. Check your bank account for the deposit.' },
+    failed:    { title: `Payout of ${amount} didn't go through`, message: `${reason ? `${reason}. ` : ''}The amount is payable again — check your bank details in Payments.` },
+    returned:  { title: `Payout of ${amount} was returned by the bank`, message: 'The amount is payable again — check your bank details in Payments.' },
+    canceled:  { title: `Payout of ${amount} was cancelled`, message: 'The amount is payable again and will go in the next payout.' },
+  };
+  const n = byStatus[status];
+  // queued → initiated is the same news twice; only say it once.
+  if (!n || (status === 'initiated' && previous === 'queued')) return;
+  await notify(payout.vendor_id, {
+    ...n, type: 'payout', link: links.vendorPayments,
+    essential: ['failed', 'returned', 'canceled'].includes(status),
+  });
 }
 
 /** Send (or re-send) a 'creating' payout to Moyasar. */

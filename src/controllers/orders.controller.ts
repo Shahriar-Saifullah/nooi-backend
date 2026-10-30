@@ -12,6 +12,8 @@ import { moyasar, MoyasarError } from '../services/payments/moyasar';
 import { syncPayoutByProviderId } from '../services/payments/payouts.service';
 import { getSettings } from '../services/settings.service';
 import { recordOrderEarnings } from '../services/payments/earnings.service';
+import { notify, notifyAdmins, vendorIdForRetailer, links } from '../services/notifications.service';
+import { money } from '../services/payments';
 
 export const createPaymentIntent = async (req: Request, res: Response) => {
   try {
@@ -316,6 +318,19 @@ async function fulfilPaidCheckout(attempt: any, paid: PaidPayment): Promise<stri
         snapshot_json: { ...attempt.snapshot_json, failure_reason: reason, refund_id: refund.id },
       })
       .eq('id', attempt.id);
+    // The shopper paid and got no order: they must hear that the money is
+    // coming back. (Stock failures send their own, more specific message.)
+    if (reason !== 'stock_insufficient') {
+      await notify(attempt.user_id, {
+        title: 'We couldn\'t complete your order',
+        message: reason === 'price_mismatch'
+          ? 'A price changed while you were paying, so we cancelled the order and refunded you in full. Please check your cart and try again.'
+          : 'Something didn\'t match while confirming your payment, so we cancelled the order and refunded you in full.',
+        type: 'order_status',
+        link: '/cart',
+        essential: true,
+      });
+    }
     return null;
   };
 
@@ -393,11 +408,12 @@ async function fulfilPaidCheckout(attempt: any, paid: PaidPayment): Promise<stri
       console.warn(`Stock insufficient during order creation for attempt ${attempt.id}. Issuing refund.`);
       await fail('stock_failed', 'stock_insufficient', { reason: 'stock_insufficient' });
 
-      await supabase.from('notifications').insert({
-        user_id: attempt.user_id,
-        title: 'Order Fulfillment Notice',
-        message: 'Your order could not be fulfilled due to insufficient stock. A full refund has been issued.',
+      await notify(attempt.user_id, {
+        title: 'An item sold out while you were paying',
+        message: 'We couldn\'t place your order because something in it is out of stock. You have been refunded in full.',
         type: 'order_status',
+        link: '/cart',
+        essential: true,
       });
 
       return null;
@@ -485,16 +501,63 @@ async function fulfilPaidCheckout(attempt: any, paid: PaidPayment): Promise<stri
     .update({ status: 'completed' })
     .eq('id', attempt.id);
 
-  // 6. Send success notification
-  await supabase.from('notifications').insert({
-    user_id: attempt.user_id,
-    title: 'Order Confirmed',
-    message: `Your order #${orderNumber} has been confirmed and is being prepared for shipment.`,
-    type: 'order_status',
-    link_url: `/orders/${orderId}`,
-  });
+  // 6. Notifications: the customer, each vendor, and vendors whose stock ran out.
+  await notifyNewOrder(orderId as unknown as string, orderNumber, attempt, snapshot);
 
   return orderId as unknown as string;
+}
+
+/**
+ * A new paid order:
+ *   customer  "Order confirmed"
+ *   vendor    "New order" — one per vendor, with their own items and total
+ *   vendor    "Out of stock" — for anything this order sold the last of
+ * Never throws: the order is already placed.
+ */
+async function notifyNewOrder(orderId: string, orderNumber: string, attempt: any, snapshot: any) {
+  try {
+    const items: any[] = snapshot?.items ?? [];
+    const count = items.reduce((n, i) => n + Number(i.quantity || 0), 0);
+    await notify(attempt.user_id, {
+      title: `Order ${orderNumber} confirmed`,
+      message: `Thanks — we've received your payment for ${count} item${count === 1 ? '' : 's'}. Each vendor will ship their part and you'll be notified at every step.`,
+      type: 'order_status',
+      link: links.order(orderId),
+    });
+
+    const byRetailer = new Map<string, any[]>();
+    for (const i of items) byRetailer.set(i.retailer_id, [...(byRetailer.get(i.retailer_id) ?? []), i]);
+    for (const [retailerId, list] of byRetailer) {
+      const vendorId = await vendorIdForRetailer(retailerId);
+      const qty = list.reduce((n, i) => n + Number(i.quantity || 0), 0);
+      const total = list.reduce((n, i) => n + Number(i.total_price || 0), 0);
+      const names = list.map(i => i.title).slice(0, 2).join(', ') + (list.length > 2 ? ` +${list.length - 2} more` : '');
+      await notify(vendorId, {
+        title: `New order ${orderNumber}`,
+        message: `${qty} item${qty === 1 ? '' : 's'} · ${money(total, attempt.currency)} — ${names}. Prepare it and add tracking when it ships.`,
+        type: 'order_status',
+        link: links.vendorOrder(orderNumber),
+      });
+    }
+
+    const variantIds = [...new Set(items.map(i => i.variant_id))];
+    if (variantIds.length) {
+      const { data: soldOut } = await supabase.from('product_variants')
+        .select('id, color, stock_quantity, products ( title, retailer_id )')
+        .in('id', variantIds).lte('stock_quantity', 0);
+      for (const v of soldOut ?? []) {
+        const product: any = (v as any).products;
+        await notify(await vendorIdForRetailer(product?.retailer_id), {
+          title: `Out of stock: ${product?.title ?? 'a product'}`,
+          message: `${v.color ? `"${v.color}" ` : ''}just sold out, so shoppers can't buy it until you add stock.`,
+          type: 'stock',
+          link: links.vendorProducts,
+        });
+      }
+    }
+  } catch (e: any) {
+    console.warn('[notify] new order notifications failed:', e?.message || e);
+  }
 }
 
 async function handlePaymentIntentFailed(pi: any) {
@@ -814,6 +877,32 @@ export const submitReturnRequest = async (req: Request, res: Response) => {
 
     if (error) {
       return res.status(500).json({ success: false, error: error.message });
+    }
+
+    // Return requested: customer (receipt), the item's vendor, and Nooi's team.
+    try {
+      const { data: item } = await supabase.from('order_items')
+        .select('retailer_id, products ( title ), orders ( order_number )')
+        .eq('id', order_item_id).maybeSingle();
+      const title = (item as any)?.products?.title ?? 'an item';
+      const orderNumber = (item as any)?.orders?.order_number ?? '';
+      await notify(userId, {
+        title: 'Return request received',
+        message: `We've received your return request for ${title}. Nooi will review it and let you know.`,
+        type: 'return', link: links.order(id as string),
+      });
+      await notify(await vendorIdForRetailer((item as any)?.retailer_id), {
+        title: `Return requested on ${orderNumber}`,
+        message: `The customer wants to return ${title}: "${String(reason).trim().slice(0, 200)}". Nooi will decide and let you know.`,
+        type: 'return', link: links.vendorReturns,
+      });
+      await notifyAdmins({
+        title: `New return request · ${orderNumber}`,
+        message: `${title}: ${String(reason).trim().slice(0, 200)}`,
+        type: 'admin', link: links.admin('refunds', data.id),
+      });
+    } catch (e: any) {
+      console.warn('[notify] return request notifications failed:', e?.message || e);
     }
 
     return res.json({ success: true, return_request: data });

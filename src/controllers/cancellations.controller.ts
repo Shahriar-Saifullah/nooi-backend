@@ -17,6 +17,7 @@
 import { Response } from 'express';
 import { supabase } from '../services/supabase';
 import { AuthRequest } from '../types';
+import { notifyAdmins, notifyOrderVendors, links } from '../services/notifications.service';
 
 const NOT_DISPATCHED = ['label_pending', 'label_created'];
 
@@ -47,6 +48,16 @@ export async function requestOrderCancellation(req: AuthRequest, res: Response) 
       if ((error as any).code === '23505') return res.status(409).json({ success: false, error: 'You have already asked to cancel this order.' });
       return res.status(400).json({ success: false, error: error.message });
     }
+    await notifyOrderVendors(orderId, num => ({
+      title: `Hold order ${num} — cancellation requested`,
+      message: `The customer asked to cancel: "${reason.slice(0, 200)}". Don't ship it until Nooi decides; you'll be notified.`,
+      type: 'cancellation', link: links.vendorOrder(num), essential: true,
+    }));
+    await notifyAdmins({
+      title: `Cancellation request · ${order.order_number}`,
+      message: `Customer: ${reason.slice(0, 200)}`,
+      type: 'admin', link: links.admin('cancellations', data.id),
+    });
     return res.status(201).json({ success: true, data: { request: data }, message: 'Cancellation requested. We\'ll let you know shortly.' });
   } catch (err) {
     console.error('requestOrderCancellation error:', err);
@@ -90,6 +101,14 @@ export async function requestShipmentCancellation(req: AuthRequest, res: Respons
     if (error) {
       if ((error as any).code === '23505') return res.status(409).json({ success: false, error: 'You have already asked to cancel this order.' });
       return res.status(400).json({ success: false, error: error.message });
+    }
+    {
+      const { data: o } = await supabase.from('orders').select('order_number').eq('id', ship.order_id).maybeSingle();
+      await notifyAdmins({
+        title: `Vendor can't fulfil · ${o?.order_number ?? 'an order'}`,
+        message: `Vendor asked to cancel their part: ${reason.slice(0, 200)}`,
+        type: 'admin', link: links.admin('cancellations', data.id),
+      });
     }
     return res.status(201).json({ success: true, data: { request: data }, message: 'Cancellation requested. Nooi will review it and refund the customer.' });
   } catch (err) {

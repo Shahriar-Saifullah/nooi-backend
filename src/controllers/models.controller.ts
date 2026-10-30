@@ -10,6 +10,7 @@
 import { Response } from 'express';
 import { supabase } from '../services/supabase';
 import { AuthRequest } from '../types';
+import { notify, links } from '../services/notifications.service';
 import {
   providerStatus, queueModelJob, productPhotos, storeUploadedGlb, rotateStoredGlb,
   publishModel, unpublishModel, ACTIVE,
@@ -27,7 +28,7 @@ async function audit(req: AuthRequest, action: string, entityId: string, summary
 async function notifyVendor(productId: string, title: string, message: string) {
   const { data } = await supabase.from('products').select('retailers ( vendor_id )').eq('id', productId).maybeSingle();
   const vendorId = (data as any)?.retailers?.vendor_id;
-  if (vendorId) await supabase.from('notifications').insert({ user_id: vendorId, title, message, type: 'listing', link_url: '/sell/products' });
+  await notify(vendorId, { title, message, type: 'listing', link: links.vendorProducts });
 }
 
 const PRODUCT_COLS = `id, title, listing_status, specs_json, created_at,
