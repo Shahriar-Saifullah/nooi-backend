@@ -38,7 +38,7 @@ describe('tripo provider (simulated API)', () => {
   it('submits with the bearer key and returns the task id', async () => {
     reply(200, { code: 0, data: { task_id: 'task_1' } });
     await expect(tripo.submit({ mode: 'single', images: [{ view: 'front', url: A }] })).resolves.toBe('task_1');
-    expect(calls[0].url).toBe('https://openapi.tripo3d.com/v3/generation/image-to-model');
+    expect(calls[0].url).toBe('https://openapi.tripo3d.ai/v3/generation/image-to-model');
     expect(calls[0].init.headers.Authorization).toBe('Bearer tsk_test');
   });
 

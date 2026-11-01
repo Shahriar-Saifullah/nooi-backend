@@ -1,7 +1,10 @@
 /**
  * Tripo3D provider — services/model3d/tripo.ts
  * ============================================================================
- * Tripo API v3 (https://developers.tripo3d.com):
+ * Tripo API v3 (international: https://developers.tripo3d.ai — keys from
+ * platform.tripo3d.ai, paid in USD). Tripo's mainland-China platform runs the
+ * same API at openapi.tripo3d.com with separate accounts and keys; set
+ * TRIPO_API_BASE=https://openapi.tripo3d.com/v3 only for a key from there.
  *
  *   one photo     POST /v3/generation/image-to-model       { input: url, ... }
  *   2–4 sides     POST /v3/generation/multiview-to-model   { inputs: [{ front: url }, { left: url }, ...] }
@@ -23,7 +26,8 @@
 
 import type { ModelProvider, PollResult, SubmitInput } from './providers';
 
-const BASE = (process.env.TRIPO_API_BASE || 'https://openapi.tripo3d.com/v3').replace(/\/+$/, '');
+const BASE = (process.env.TRIPO_API_BASE || 'https://openapi.tripo3d.ai/v3').replace(/\/+$/, '');
+export const TRIPO_BASE = BASE;
 
 /** `permanent`: retrying the same request can't help (bad photo, bad key).
  *  `waitMs`: not a failure of the job — try again later (no credits, busy). */
@@ -45,13 +49,13 @@ function toError(httpStatus: number, body: any): ProviderError {
     case 2010: return new ProviderError('The Tripo account is out of credits. Top up — jobs resume by themselves.', false, 15 * 60_000);
     case 2000: return new ProviderError('Tripo is busy with other jobs; will retry.', false, 60_000);
     case 1007: return new ProviderError('Tripo rate limit; will retry.', false, 60_000);
-    case 1000: case 1001: return new ProviderError('Tripo rejected the API key. Check TRIPO_API_KEY.', false, 15 * 60_000);
+    case 1000: case 1001: return new ProviderError(`Tripo rejected the API key (${new URL(BASE).host}). Check TRIPO_API_KEY is the secret key (tsk_…), not the client ID.`, false, 15 * 60_000);
     case 2008: return new ProviderError('Tripo refused these photos (content policy).', true);
     case 2003: case 2004: return new ProviderError('Tripo couldn\'t read a photo (empty or unsupported format — use JPG, PNG or WebP).', true);
     case 2002: return new ProviderError(`Tripo rejected the request: ${msg}`, true);
   }
   if (httpStatus === 429 || httpStatus >= 500) return new ProviderError(`Tripo is unavailable (${httpStatus}); will retry.`, false, 60_000);
-  if (httpStatus === 401) return new ProviderError('Tripo rejected the API key. Check TRIPO_API_KEY.', false, 15 * 60_000);
+  if (httpStatus === 401) return new ProviderError(`Tripo rejected the API key (${new URL(BASE).host}). Check TRIPO_API_KEY is the secret key (tsk_…), not the client ID.`, false, 15 * 60_000);
   if (httpStatus === 403) return new ProviderError('The Tripo account is out of credits or not allowed to do this.', false, 15 * 60_000);
   return new ProviderError(msg, httpStatus === 400);
 }
