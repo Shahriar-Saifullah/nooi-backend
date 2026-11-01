@@ -13,7 +13,7 @@
 
 import 'dotenv/config';
 import { writeFileSync } from 'fs';
-import { tripo } from '../src/services/model3d/tripo';
+import { tripo, TRIPO_BASE } from '../src/services/model3d/tripo';
 import { optimizeGlb, turnToFrontDeg } from '../src/services/model3d/optimize';
 import { downloadGlb } from '../src/services/model3d';
 
@@ -22,6 +22,7 @@ async function main() {
     console.error('TRIPO_API_KEY is not set (put it in .env or the shell).');
     process.exit(1);
   }
+  console.log(`Tripo API: ${TRIPO_BASE}`);
   const b = await tripo.balance!();
   console.log(`✓ Key works. Balance: ${b.balance} credits (${b.frozen} held for running jobs).`);
 
