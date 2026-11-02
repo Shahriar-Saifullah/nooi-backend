@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import crypto from 'crypto';
+import sharp from 'sharp';
 import { supabase } from '../services/supabase';
 import { AuthRequest } from '../types';
 import { GoogleGenerativeAI } from '@google/generative-ai';
@@ -1707,6 +1708,60 @@ export async function saveWalls(req: AuthRequest, res: Response) {
       return res.status(400).json({ success: false, error: error.message });
     }
     return res.json({ success: true, data: { room_data: data.room_data } });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+}
+
+// ─── Project picture ─────────────────────────────────────────────────────────
+// PUT /projects/:id/thumbnail  { image: dataURL }
+//
+// The canvas captures the standard 3D overview of the home and sends it here;
+// it becomes the project's thumbnail_url, shown on "Shop this room" in the
+// marketplace and on the dashboard card. One file per project, overwritten
+// each time; the ?v= stamp makes browsers fetch the new one. updated_at is
+// left alone — refreshing a picture is not an edit to the design.
+export async function saveThumbnail(req: AuthRequest, res: Response) {
+  try {
+    const userId    = req.user!.id;
+    const projectId = String(req.params.id);
+    const { image } = req.body as { image: string };
+
+    const project = await verifyOwnership(projectId, userId);
+    if (!project) {
+      return res.status(404).json({ success: false, error: 'Project not found' });
+    }
+
+    let jpeg: Buffer;
+    try {
+      const raw = Buffer.from(image.slice(image.indexOf(',') + 1), 'base64');
+      jpeg = await sharp(raw, { failOn: 'error' })
+        .resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true })
+        .jpeg({ quality: 82, mozjpeg: true })
+        .toBuffer();
+    } catch {
+      return res.status(400).json({ success: false, error: 'That picture could not be read' });
+    }
+
+    const storagePath = `thumbnails/${userId}/${projectId}.jpg`;
+    const { error: uploadError } = await supabase.storage
+      .from('nooi-projects')
+      .upload(storagePath, jpeg, { contentType: 'image/jpeg', upsert: true, cacheControl: '60' });
+    if (uploadError) {
+      return res.status(500).json({ success: false, error: uploadError.message });
+    }
+    const { data: { publicUrl } } = supabase.storage.from('nooi-projects').getPublicUrl(storagePath);
+    const thumbnailUrl = `${publicUrl}?v=${Date.now()}`;
+
+    const { error } = await supabase
+      .from('projects')
+      .update({ thumbnail_url: thumbnailUrl })
+      .eq('id', projectId)
+      .eq('user_id', userId);
+    if (error) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+    return res.json({ success: true, data: { thumbnail_url: thumbnailUrl } });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err.message });
   }

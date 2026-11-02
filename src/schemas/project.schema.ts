@@ -220,3 +220,11 @@ export const saveWallsSchema = z.object({
   })).max(400).optional(),
 });
 export type SaveWallsInput = z.infer<typeof saveWallsSchema>;
+// PUT /projects/:id/thumbnail — the project picture (the 3D overview the
+// canvas captures), as a JPEG / PNG / WebP data-URL. ~1–3 MB at most.
+export const saveThumbnailSchema = z.object({
+  image: z.string()
+    .regex(/^data:image\/(jpeg|png|webp);base64,/, 'Expected an image data-URL')
+    .max(8_000_000),
+});
+export type SaveThumbnailInput = z.infer<typeof saveThumbnailSchema>;
