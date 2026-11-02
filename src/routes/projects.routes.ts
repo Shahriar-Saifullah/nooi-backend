@@ -13,6 +13,7 @@ import {
   aiFurnishSchema,
   renderSceneSchema,
   saveWallsSchema,
+  saveThumbnailSchema,
 } from '../schemas/project.schema';
 import {
   createProject,
@@ -30,6 +31,7 @@ import {
   aiFurnish,
   renderScene,
   saveWalls,
+  saveThumbnail,
 } from '../controllers/project.controller';
 
 const router = Router();
@@ -53,6 +55,7 @@ router.post('/:id/share',       requireAuth, validate(toggleShareSchema),   togg
 router.post('/:id/ai-furnish',  requireAuth, validate(aiFurnishSchema),    aiFurnish);
 router.post('/:id/render-scene', requireAuth, validate(renderSceneSchema), renderScene);
 router.put('/:id/walls',        requireAuth, validate(saveWallsSchema),   saveWalls);
+router.put('/:id/thumbnail',    requireAuth, validate(saveThumbnailSchema), saveThumbnail);
 
 // ─── Standard CRUD ────────────────────────────────────────────────────────────
 
