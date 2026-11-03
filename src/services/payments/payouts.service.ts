@@ -16,7 +16,7 @@ import { moyasar, MoyasarError, MoyasarPayout } from './moyasar';
 import { payoutHoldDays } from './index';
 import { getSettings } from '../settings.service';
 import { notify, links } from '../notifications.service';
-import { fromMinor } from './ledger';
+import { fromMinor, payoutDestination, saudiMobileLocal } from './ledger';
 
 export class PayoutError extends Error {
   status: number;
@@ -82,7 +82,9 @@ export async function sendPayout(payoutId: string) {
       sequence_number: payout.sequence_number,
       amount: Number(payout.amount_minor),
       purpose: process.env.MOYASAR_PAYOUT_PURPOSE || 'payment_to_merchant',
-      destination: payout.destination,
+      // stored as the vendor typed it; sent in the form Moyasar validates
+      // (mobile as 05XXXXXXXX, IBAN without spaces, country code)
+      destination: payoutDestination(payout.destination || {}),
       comment: `Nooi payout ${payout.sequence_number}`,
       metadata: { payout_id: payout.id, vendor_id: payout.vendor_id },
     });
@@ -105,6 +107,14 @@ export async function sendPayout(payoutId: string) {
 }
 
 export async function createVendorPayout(vendorId: string, adminId: string) {
+  // Catch a non-Saudi mobile here, with a message that says so, rather than
+  // claiming the earnings and getting a bare "Data validation failed" back.
+  const { data: acct } = await supabase.from('vendor_payout_accounts')
+    .select('mobile').eq('vendor_id', vendorId).maybeSingle();
+  if (acct && !/^05\d{8}$/.test(saudiMobileLocal(acct.mobile || ''))) {
+    throw new PayoutError('The vendor\'s payout mobile must be a Saudi number (05XXXXXXXX). Ask them to update it in Payments.', 409);
+  }
+
   const { data: payoutId, error } = await supabase.rpc('claim_vendor_payout', {
     p_vendor_id: vendorId,
     p_admin_id: adminId,

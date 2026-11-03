@@ -140,3 +140,32 @@ export function normaliseSaudiIban(raw: string): string | null {
 
 export const maskIban = (iban: string) =>
   iban ? `${iban.slice(0, 4)} •••• •••• ${iban.slice(-4)}` : '';
+
+/**
+ * A Saudi mobile in the local form Moyasar's payout API expects
+ * ("05XXXXXXXX", as in its docs). Vendors type it every way: +9665…,
+ * 009665…, 9665…, 5… — all become 05…. Anything that isn't a Saudi mobile is
+ * passed through with spaces and dashes removed.
+ */
+export function saudiMobileLocal(raw: string): string {
+  const m = String(raw || '').replace(/[\s\-()]/g, '');
+  const digits = m.replace(/^\+/, '').replace(/^00/, '');
+  if (/^9665\d{8}$/.test(digits)) return `0${digits.slice(3)}`;
+  if (/^05\d{8}$/.test(digits)) return digits;
+  if (/^5\d{8}$/.test(digits)) return `0${digits}`;
+  return m;
+}
+
+/** The bank destination exactly as a Moyasar payout wants it. */
+export function payoutDestination(d: {
+  type?: string; iban?: string; name?: string; mobile?: string; country?: string; city?: string;
+}) {
+  return {
+    type: 'bank' as const,
+    iban: String(d.iban || '').replace(/[\s-]/g, '').toUpperCase(),
+    name: String(d.name || '').replace(/\s+/g, ' ').trim(),
+    mobile: saudiMobileLocal(d.mobile || ''),
+    country: (String(d.country || 'SA').trim().toUpperCase() || 'SA'),
+    city: String(d.city || '').trim(),
+  };
+}

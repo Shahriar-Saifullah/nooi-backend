@@ -2,7 +2,7 @@ import { Response } from 'express';
 import { supabase } from '../services/supabase';
 import { AuthRequest } from '../types';
 import { releaseEarnings } from '../services/payments/earnings.service';
-import { fromMinor, maskIban, normaliseSaudiIban, summarise } from '../services/payments/ledger';
+import { fromMinor, maskIban, normaliseSaudiIban, saudiMobileLocal, summarise } from '../services/payments/ledger';
 import { payoutHoldDays } from '../services/payments';
 import { notify, notifyAdmins, links } from '../services/notifications.service';
 import { UpdateVendorProfileInput } from '../schemas/auth.schema';
@@ -673,13 +673,15 @@ export async function saveVendorPayoutAccount(req: AuthRequest, res: Response) {
     const b = req.body || {};
     const iban = normaliseSaudiIban(b.iban);
     const holder = String(b.account_holder || '').trim().slice(0, 140);
-    const mobile = String(b.mobile || '').replace(/[\s-]/g, '').slice(0, 20);
+    // Saudi bank transfers (Moyasar → SARIE) need a Saudi mobile; a foreign
+    // number is refused at payout time with only "Data validation failed".
+    const mobile = saudiMobileLocal(String(b.mobile || '')).slice(0, 20);
     const city = String(b.city || '').trim().slice(0, 80);
     const bank = String(b.bank_name || '').trim().slice(0, 80) || null;
 
     if (!iban) return res.status(400).json({ success: false, error: 'Enter a valid Saudi IBAN (SA followed by 22 digits).' });
     if (holder.length < 2) return res.status(400).json({ success: false, error: 'Enter the account holder name exactly as the bank has it.' });
-    if (!/^\+?\d{9,15}$/.test(mobile)) return res.status(400).json({ success: false, error: 'Enter a mobile number, e.g. +9665XXXXXXXX.' });
+    if (!/^05\d{8}$/.test(mobile)) return res.status(400).json({ success: false, error: 'Enter a Saudi mobile number (05XXXXXXXX or +9665XXXXXXXX). Bank payouts in Saudi Arabia need one.' });
     if (!city) return res.status(400).json({ success: false, error: 'Enter the city of the bank account.' });
 
     const { data: prev } = await supabase.from('vendor_payout_accounts').select('*').eq('vendor_id', vendorId).maybeSingle();
