@@ -93,3 +93,33 @@ describe('Saudi IBAN', () => {
     expect(maskIban(VALID)).toBe('SA03 •••• •••• 7519');
   });
 });
+
+import { saudiMobileLocal, payoutDestination } from '../services/payments/ledger';
+import { withFieldErrors } from '../services/payments/moyasar';
+
+describe('Moyasar payout destination', () => {
+  it('sends Saudi mobiles in the local 05XXXXXXXX form', () => {
+    for (const raw of ['+966512345678', '00966512345678', '966512345678', '0512345678', '512345678', '+966 51 234 5678', '051-234-5678']) {
+      expect(saudiMobileLocal(raw)).toBe('0512345678');
+    }
+    expect(saudiMobileLocal('+971501234567')).toBe('+971501234567');   // not Saudi: left as typed
+  });
+
+  it('cleans the stored destination', () => {
+    expect(payoutDestination({
+      type: 'bank', iban: 'sa03 8000 0000 6080 1016 7519', name: '  Atelier   Maison ',
+      mobile: '+966512345678', country: 'sa', city: ' Riyadh ',
+    })).toEqual({
+      type: 'bank', iban: 'SA0380000000608010167519', name: 'Atelier Maison',
+      mobile: '0512345678', country: 'SA', city: 'Riyadh',
+    });
+  });
+
+  it('says which field Moyasar refused', () => {
+    expect(withFieldErrors('Data validation failed', { destination: { mobile: ['is invalid'] }, amount: ['must be greater than 0'] }))
+      .toBe('Data validation failed (destination.mobile: is invalid; amount: must be greater than 0)');
+    expect(withFieldErrors('Data validation failed', { 'destination.iban': ['is invalid'] }))
+      .toBe('Data validation failed (destination.iban: is invalid)');
+    expect(withFieldErrors('Not found', undefined)).toBe('Not found');
+  });
+});

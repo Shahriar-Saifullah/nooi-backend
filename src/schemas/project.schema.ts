@@ -125,6 +125,13 @@ export const furnitureItemSchema = z.object({
   // Lamps only: 0 = off … 1 = full brightness. Listed here because validate()
   // keeps ONLY the declared keys — an undeclared field is silently dropped.
   lightLevel:     z.number().min(0).max(1).optional(),
+  // A size the user typed in (real cm). Overrides the catalogue size; the
+  // size slider (sizeScale) still multiplies it.
+  dims:           z.object({
+    w: z.number().min(5).max(2000),
+    d: z.number().min(1).max(2000),
+    h: z.number().min(1).max(600),
+  }).optional(),
 });
 
 export const saveFurnitureSchema = z.object({

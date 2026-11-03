@@ -67,6 +67,26 @@ export function moyasarConfigured(): boolean {
   return Boolean(process.env.MOYASAR_SECRET_KEY);
 }
 
+/**
+ * "Data validation failed" alone says nothing; Moyasar puts the reasons in
+ * `errors` ({ field: [messages] }, nested for destination). Fold them into
+ * the message so admins (and the vendor's failed-payout notice) see which
+ * field was refused.
+ */
+export function withFieldErrors(message: string, errors: unknown): string {
+  const parts: string[] = [];
+  const walk = (v: unknown, path: string) => {
+    if (v == null) return;
+    if (typeof v === 'string') { parts.push(path ? `${path}: ${v}` : v); return; }
+    if (Array.isArray(v)) { v.forEach(x => walk(x, path)); return; }
+    if (typeof v === 'object') {
+      for (const [k, x] of Object.entries(v as Record<string, unknown>)) walk(x, path ? `${path}.${k}` : k);
+    }
+  };
+  walk(errors, '');
+  return parts.length ? `${message} (${parts.join('; ')})` : message;
+}
+
 async function call<T>(method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> {
   const key = process.env.MOYASAR_SECRET_KEY;
   if (!key) throw new MoyasarError('MOYASAR_SECRET_KEY is not set', 500);
@@ -97,7 +117,7 @@ async function call<T>(method: 'GET' | 'POST', path: string, body?: unknown): Pr
   try { data = text ? JSON.parse(text) : null; } catch { /* non-JSON error page */ }
   if (!res.ok) {
     const msg = data?.message || `Moyasar ${method} ${path} failed (${res.status})`;
-    throw new MoyasarError(msg, res.status, data?.type, data?.errors);
+    throw new MoyasarError(withFieldErrors(msg, data?.errors), res.status, data?.type, data?.errors);
   }
   return data as T;
 }
