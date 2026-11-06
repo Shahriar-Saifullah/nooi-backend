@@ -19,6 +19,7 @@ import sharedRoutes         from './routes/shared.routes';
 import notificationRoutes   from './routes/notifications.routes';
 import supportRoutes        from './routes/support.routes';
 import termsRoutes          from './routes/terms.routes';
+import searchRoutes         from './routes/search.routes';
 import { errorHandler }     from './middleware/errorHandler';
 import { startModelWorker } from './services/model3d';
 import { stripeWebhookHandler, moyasarWebhookHandler } from './controllers/orders.controller';
@@ -66,6 +67,7 @@ app.use('/shared',         sharedRoutes);
 app.use('/notifications',  notificationRoutes);
 app.use('/support',        supportRoutes);
 app.use('/terms',          termsRoutes);
+app.use('/search',         searchRoutes);
 
 // Error handler
 app.use(errorHandler);
