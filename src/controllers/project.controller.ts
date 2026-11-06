@@ -531,7 +531,7 @@ export async function saveFurniture(req: AuthRequest, res: Response) {
     const userId    = req.user!.id;
     const projectId = String(req.params.id);
     const {
-      furniture, wall_colors, wall_surfaces, door_finishes, floor_surfaces,
+      furniture, wall_colors, wall_surfaces, door_finishes, floor_surfaces, kitchen,
     } = req.body as {
       furniture: unknown[];
       wall_colors?: Record<string, string>;
@@ -540,6 +540,8 @@ export async function saveFurniture(req: AuthRequest, res: Response) {
       /** Per-room floor finish, keyed by ROOM id — unlike the wall maps,
        *  which are keyed by wall face. */
       floor_surfaces?: Record<string, string>;
+      /** Kitchen builder: cabinet runs along walls + their style. */
+      kitchen?: unknown;
     };
 
     const project = await verifyOwnership(projectId, userId);
@@ -561,6 +563,7 @@ export async function saveFurniture(req: AuthRequest, res: Response) {
           ...(wall_surfaces !== undefined ? { wall_surfaces } : {}),
           ...(door_finishes !== undefined ? { door_finishes } : {}),
           ...(floor_surfaces !== undefined ? { floor_surfaces } : {}),
+          ...(kitchen !== undefined ? { kitchen } : {}),
         },
         updated_at: new Date().toISOString(),
       })
