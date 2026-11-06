@@ -63,6 +63,7 @@ export const updateVendorProfileSchema = z.object({
   tax_id: z.string().optional(),
   description: z.string().optional(),
   logo_url: z.string().url('Invalid logo URL').optional().or(z.literal('')),
+  store_name: z.string().trim().min(2, 'Store name must be at least 2 characters').max(80).optional(),
 });
 
 // Admin Schemas

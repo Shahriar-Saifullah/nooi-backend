@@ -8,6 +8,7 @@
  */
 
 import { supabase } from './supabase';
+import { cleanKitchenPrices, DEFAULT_KITCHEN_PRICES, type KitchenPriceList } from './kitchenPricing';
 
 export interface PlatformSettings {
   default_commission_rate: number;
@@ -20,6 +21,8 @@ export interface PlatformSettings {
   legal_address: string | null;
   vat_number: string | null;
   cr_number: string | null;
+  /** Nooi's kitchen price list (per metre / per unit), see kitchenPricing.ts */
+  kitchen_prices: KitchenPriceList;
   updated_at?: string | null;
   updated_by?: string | null;
 }
@@ -35,6 +38,7 @@ const FALLBACK: PlatformSettings = {
   legal_address: null,
   vat_number: null,
   cr_number: null,
+  kitchen_prices: DEFAULT_KITCHEN_PRICES,
 };
 
 let cache: { at: number; value: PlatformSettings } | null = null;
@@ -54,6 +58,7 @@ export async function getSettings(fresh = false): Promise<PlatformSettings> {
     payout_hold_days: Number(data.payout_hold_days),
     return_window_days: Number(data.return_window_days),
     min_payout_sar: Number(data.min_payout_sar),
+    kitchen_prices: cleanKitchenPrices(data.kitchen_prices),
   };
   cache = { at: Date.now(), value };
   return value;
@@ -85,6 +90,10 @@ export function validateSettingsPatch(body: any): { error: string } | { patch: P
     if (body[k] === undefined) continue;
     const v = String(body[k] ?? '').trim().slice(0, 300);
     (patch as any)[k] = v || null;
+  }
+  if (body.kitchen_prices !== undefined) {
+    if (!body.kitchen_prices || typeof body.kitchen_prices !== 'object') return { error: 'Kitchen prices must be an object.' };
+    patch.kitchen_prices = cleanKitchenPrices(body.kitchen_prices);
   }
   if (patch.support_email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(patch.support_email)) {
     return { error: 'Support email is not a valid email address.' };

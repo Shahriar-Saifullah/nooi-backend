@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import { REQUIRED_BY_ROLE, missingDocuments, recordAcceptance, requestIp } from '../services/terms.service';
 import crypto from 'crypto';
 import Stripe from 'stripe';
 import { supabase } from '../services/supabase';
@@ -368,7 +369,10 @@ async function fulfilPaidCheckout(attempt: any, paid: PaidPayment): Promise<stri
       const priceMap = new Map(currentVariants.map((v: any) => [v.id, Number(v.price)]));
       const hasPriceMismatch = snapshot.items.some((item: any) => {
         const livePrice = priceMap.get(item.variant_id);
-        return livePrice !== undefined && livePrice !== item.unit_price;
+        // Configured lines (width, options) have a unit price of their own;
+        // compare the variant's price the quote was built on.
+        const quoted = item.base_price ?? item.unit_price;
+        return livePrice !== undefined && livePrice !== Number(quoted);
       });
 
       if (hasPriceMismatch) {
@@ -965,6 +969,30 @@ function moyasarFormConfig(attempt: { id: string; grand_total_cents: number; cur
   return config;
 }
 
+/**
+ * A shopper accepts Nooi's terms and privacy policy before paying. The
+ * checkout sends accept_terms: true when the box is ticked, and that is
+ * recorded (version, time, IP, browser). Without it, an earlier acceptance of
+ * the current version is needed. A database error lets the payment through —
+ * a broken audit table must not stop sales — and is logged.
+ */
+async function clientTermsMissing(req: Request, userId: string): Promise<string[]> {
+  try {
+    if ((req.body as any)?.accept_terms === true) {
+      await recordAcceptance(userId, 'client', REQUIRED_BY_ROLE.client, {
+        context: 'checkout',
+        ip: requestIp(req as any),
+        userAgent: req.headers['user-agent'] || null,
+      });
+      return [];
+    }
+    return await missingDocuments(userId, 'client');
+  } catch (err: any) {
+    console.error('[terms] acceptance check failed, allowing checkout:', err?.message);
+    return [];
+  }
+}
+
 export const createMoyasarCheckout = async (req: Request, res: Response) => {
   try {
     const userId = (req as AuthRequest).user?.id;
@@ -981,6 +1009,16 @@ export const createMoyasarCheckout = async (req: Request, res: Response) => {
       typeof (req.body as any)?.promo_code === 'string'
         ? (req.body as any).promo_code.trim().slice(0, 64) || null
         : null;
+
+    const missingTerms = await clientTermsMissing(req, userId);
+    if (missingTerms.length) {
+      return res.status(428).json({
+        success: false,
+        code: 'TERMS_REQUIRED',
+        missing: missingTerms,
+        error: "Please accept Nooi's Terms of Service and Privacy Policy to pay.",
+      });
+    }
 
     const summary = await calculateCheckout(userId, parsed.data.shipping_address, checkoutCurrency(), promoCode);
     if (summary.grand_total_cents < 100) {

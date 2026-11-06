@@ -23,6 +23,12 @@ router.get('/canvas-items', getCanvasItems);
 router.get('/affiliate/click', trackAffiliateClick);
 router.get('/facets', getFacets);
 
+// Nooi's kitchen price list — the canvas kitchen builder quotes from it.
+router.get('/kitchen-prices', async (_req, res) => {
+  const s = await getSettings();
+  res.json({ success: true, data: { prices: s.kitchen_prices } });
+});
+
 // Public contact details (admin Settings) for footers, support and receipts.
 router.get('/platform-info', async (_req, res) => {
   const s = await getSettings();

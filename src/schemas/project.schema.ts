@@ -254,6 +254,9 @@ export const saveWallsSchema = z.object({
     x: z.number(), y: z.number(),
     width: z.number(),
     wall_id: z.string().max(64).optional(),
+    // windows: how they're drawn (frontend lib/walls/windowStyles)
+    style: z.enum(["fixed", "casement", "sliding", "grid", "full-height", "mashrabiya"]).optional(),
+    frame: z.enum(["white", "black", "bronze", "wood", "silver"]).optional(),
   })).max(400).optional(),
 });
 export type SaveWallsInput = z.infer<typeof saveWallsSchema>;

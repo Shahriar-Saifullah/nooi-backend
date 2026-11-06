@@ -36,6 +36,7 @@ import {
   markShipmentDelivered,
 } from '../controllers/admin.controller';
 import { requireAdmin } from '../middleware/auth.middleware';
+import { adminListTermsAcceptances } from '../controllers/terms.controller';
 import {
   listListings, getListing, decideListing,
   listCancellations, getCancellation, approveCancellation, declineCancellation,
@@ -59,6 +60,7 @@ const router = Router();
 
 // All admin routes require role='admin' or 'super_admin'
 router.get('/stats', requireAdmin, getAdminStats);
+router.get('/terms-acceptances', requireAdmin, adminListTermsAcceptances);
 
 // Vendor Management
 //

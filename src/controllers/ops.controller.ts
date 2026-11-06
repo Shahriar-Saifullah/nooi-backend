@@ -407,7 +407,8 @@ export async function updatePlatformSettings(req: AuthRequest, res: Response) {
     .update({ ...v.patch, updated_by: req.user!.id, updated_at: new Date().toISOString() }).eq('id', 1);
   if (error) return res.status(400).json({ success: false, error: error.message });
   clearSettingsCache();
-  const changed = Object.keys(v.patch).filter(k => String((before as any)[k] ?? '') !== String((v.patch as any)[k] ?? ''));
+  const same = (a: unknown, b: unknown) => JSON.stringify(a ?? '') === JSON.stringify(b ?? '');
+  const changed = Object.keys(v.patch).filter(k => !same((before as any)[k], (v.patch as any)[k]));
   if (changed.length) {
     await audit(req, 'settings.updated', 'platform', 'settings', `Changed ${changed.join(', ').replace(/_/g, ' ')}`,
       { before: Object.fromEntries(changed.map(k => [k, (before as any)[k]])), after: Object.fromEntries(changed.map(k => [k, (v.patch as any)[k]])) });

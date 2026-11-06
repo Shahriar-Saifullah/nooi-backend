@@ -4,6 +4,9 @@ import { supabase } from '../services/supabase';
 import { calculateShipping } from '../services/shipping.service';
 import { calculateTax } from '../services/tax.service';
 import { validatePromotion } from '../services/promotion.service';
+import { configKey, normalizeConfig, priceLine, type LineConfig } from '../services/configure';
+import { listingForPricing } from '../services/listingPricing';
+
 
 /**
  * Cart — the signed-in shopper's server cart (cart_items).
@@ -27,10 +30,10 @@ type Req = Request & { user?: { id: string } };
 const CART_SELECT = '*, product_variants(*, products(*, retailers(*)))';
 
 /** Whether a variant can be put in a cart right now, and why not if not. */
-async function checkVariant(variantId: string): Promise<{ ok: true; stock: number } | { ok: false; status: number; error: string }> {
+async function checkVariant(variantId: string, config?: LineConfig): Promise<{ ok: true; stock: number } | { ok: false; status: number; error: string; message?: string }> {
   const { data: v } = await supabase
     .from('product_variants')
-    .select('id, is_active, stock_quantity, products ( listing_status, title )')
+    .select('id, is_active, stock_quantity, price, dimensions_cm, products ( listing_status, title, price_unit, min_width_cm, max_width_cm, options )')
     .eq('id', variantId)
     .maybeSingle();
   if (!v) return { ok: false, status: 404, error: 'VARIANT_NOT_FOUND' };
@@ -38,6 +41,9 @@ async function checkVariant(variantId: string): Promise<{ ok: true; stock: numbe
   if (v.is_active === false || (product?.listing_status && product.listing_status !== 'approved')) {
     return { ok: false, status: 422, error: 'VARIANT_UNAVAILABLE' };
   }
+  // A width or option the listing doesn't offer can't go in the cart.
+  const priced = priceLine(listingForPricing(product, v), Number((v as any).price), config);
+  if (!priced.ok) return { ok: false, status: 422, error: priced.error, message: priced.message };
   return { ok: true, stock: Number(v.stock_quantity ?? 0) };
 }
 
@@ -61,13 +67,17 @@ export const addToCart = async (req: Request, res: Response) => {
     const userId = (req as Req).user!.id;
     const { variant_id, quantity = 1 } = req.body;
     if (!isUuid(variant_id)) return res.status(404).json({ success: false, error: 'VARIANT_NOT_FOUND' });
+    // Width (per-metre listings) and options. The key is built from what was
+    // sent, so the client can match its lines to these without the listing.
+    const config = normalizeConfig(req.body?.config);
+    const config_key = configKey(config);
 
-    const check = await checkVariant(variant_id);
-    if (!check.ok) return res.status(check.status).json({ success: false, error: check.error });
+    const check = await checkVariant(variant_id, config);
+    if (!check.ok) return res.status(check.status).json({ success: false, error: check.error, message: check.message });
 
     const { data: existing, error: readErr } = await supabase
       .from('cart_items').select('id, quantity')
-      .eq('user_id', userId).eq('variant_id', variant_id).maybeSingle();
+      .eq('user_id', userId).eq('variant_id', variant_id).eq('config_key', config_key).maybeSingle();
     if (readErr) return res.status(500).json({ success: false, error: readErr.message });
 
     const { data, error } = existing
@@ -76,7 +86,7 @@ export const addToCart = async (req: Request, res: Response) => {
           .eq('id', existing.id).eq('user_id', userId)
           .select(CART_SELECT).single()
       : await supabase.from('cart_items')
-          .insert({ user_id: userId, session_id: null, variant_id, quantity: Number(quantity) })
+          .insert({ user_id: userId, session_id: null, variant_id, quantity: Number(quantity), config, config_key })
           .select(CART_SELECT).single();
     if (error) return res.status(500).json({ success: false, error: error.message });
 
@@ -96,11 +106,11 @@ export const quoteCart = async (req: Request, res: Response) => {
     const { data: rows, error } = await supabase
       .from('cart_items')
       .select(`
-        id, quantity, variant_id,
+        id, quantity, variant_id, config, config_key,
         product_variants (
-          id, price, color, sku, images, stock_quantity, is_active,
+          id, price, color, sku, images, stock_quantity, is_active, dimensions_cm,
           products (
-            id, title, lead_time_days, listing_status,
+            id, title, lead_time_days, listing_status, price_unit, min_width_cm, max_width_cm, options,
             retailers ( id, name, logo_url, city, country, shipping_policy_json )
           )
         )
@@ -134,15 +144,18 @@ export const quoteCart = async (req: Request, res: Response) => {
       const retailer: any = product?.retailers;
       if (!variant || !product || !retailer) continue;
  
-      const unit = Number(variant.price);
+      // Width and options priced from the listing (configure.ts).
+      const priced = priceLine(listingForPricing(product, variant), Number(variant.price), (row as any).config);
+      const unit = priced.ok ? priced.unit_price : Number(variant.price);
       const lineTotal = Number((unit * row.quantity).toFixed(2));
-      // A line can be bought only if the listing is live, the variant active
-      // and there is enough stock. Anything else stays visible in the cart
-      // (so the shopper sees why) but is left out of every total.
+      // A line can be bought only if the listing is live, the variant active,
+      // its width / options are still offered and there is enough stock.
+      // Anything else stays visible in the cart (so the shopper sees why) but
+      // is left out of every total.
       const listed = product.listing_status === 'approved' && variant.is_active !== false;
       const stock = Number(variant.stock_quantity ?? 0);
-      const available = listed && stock >= row.quantity;
-      const unavailableReason = !listed ? 'unavailable' : stock <= 0 ? 'out_of_stock' : stock < row.quantity ? 'not_enough_stock' : null;
+      const available = listed && priced.ok && stock >= row.quantity;
+      const unavailableReason = !listed ? 'unavailable' : !priced.ok ? 'options_changed' : stock <= 0 ? 'out_of_stock' : stock < row.quantity ? 'not_enough_stock' : null;
       if (available) {
         subtotal = Number((subtotal + lineTotal).toFixed(2));
         itemCount += row.quantity;
@@ -178,6 +191,10 @@ export const quoteCart = async (req: Request, res: Response) => {
         sku: variant.sku,
         image: variant.images?.[0] ?? null,
         unit_price: unit,
+        config: (row as any).config ?? {},
+        config_key: (row as any).config_key ?? '',
+        config_label: priced.ok ? priced.label : priced.message,
+        price_unit: product.price_unit === 'metre' ? 'metre' : 'unit',
         quantity: row.quantity,
         line_total: lineTotal,
         in_stock: available,
@@ -329,11 +346,12 @@ export const mergeCart = async (req: Request, res: Response) => {
         .select('*')
         .eq('user_id', userId);
 
-      const userMap = new Map((userItems || []).map(i => [i.variant_id, i]));
+      const lineKey = (i: any) => `${i.variant_id}|${i.config_key ?? ''}`;
+      const userMap = new Map((userItems || []).map(i => [lineKey(i), i]));
 
       for (const guestItem of guestItems) {
-        if (userMap.has(guestItem.variant_id)) {
-          const userItem = userMap.get(guestItem.variant_id)!;
+        if (userMap.has(lineKey(guestItem))) {
+          const userItem = userMap.get(lineKey(guestItem))!;
           await supabase
             .from('cart_items')
             .update({ quantity: userItem.quantity + guestItem.quantity, updated_at: new Date().toISOString() })
