@@ -5,6 +5,9 @@ import { calculateTax, TaxCalculationResult } from './tax.service';
 import { validatePromotion } from './promotion.service';
 import { ShippingAddressInput } from '../schemas/checkout.schema';
 import { checkoutCurrency } from './payments';
+import { countryCode, countryName } from './countries';
+import { priceLine } from './configure';
+import { listingForPricing } from './listingPricing';
 
 export interface CheckoutItemSnapshot {
   cart_item_id: string;
@@ -14,6 +17,9 @@ export interface CheckoutItemSnapshot {
   title: string;
   sku?: string;
   unit_price: number;
+  base_price?: number;
+  config?: Record<string, unknown>;
+  config_label?: string | null;
   quantity: number;
   total_price: number;
 }
@@ -100,6 +106,17 @@ export async function calculateCheckout(
       throw new CheckoutError(`"${variant.products?.title || 'A product'}" is no longer available. Remove it from your cart to continue.`, 422);
     }
 
+    // Where it ships. Only listings that state ships_to are checked (every
+    // row does once 20261106 is applied; it defaults to Saudi Arabia).
+    const shipsTo: string[] | null = Array.isArray(variant.products?.ships_to) ? variant.products.ships_to : null;
+    const dest = countryCode(shippingAddress?.country);
+    if (shipsTo && shipsTo.length && dest && !shipsTo.includes(dest)) {
+      throw new CheckoutError(
+        `"${variant.products?.title || 'A product'}" doesn't ship to ${countryName(dest)}. Remove it from your cart or choose another address.`,
+        422,
+      );
+    }
+
     if (variant.is_active === false) {
       throw new CheckoutError(`Product variant "${variant.sku || item.variant_id}" is no longer active`, 422);
     }
@@ -111,7 +128,12 @@ export async function calculateCheckout(
       );
     }
 
-    const unit_price = Number(variant.price);
+    // Width (per-metre listings) and options, priced from the listing.
+    const priced = priceLine(listingForPricing(variant.products, variant), Number(variant.price), item.config);
+    if (!priced.ok) {
+      throw new CheckoutError(`"${variant.products?.title || 'A product'}": ${priced.message}`, 422);
+    }
+    const unit_price = priced.unit_price;
     const total_price = Number((unit_price * item.quantity).toFixed(2));
     const product = variant.products || {};
     const retailer = product.retailers || {
@@ -128,6 +150,10 @@ export async function calculateCheckout(
       title: product.title || 'Product',
       sku: variant.sku,
       unit_price,
+      /** the variant's own price when quoted — what the payment check compares */
+      base_price: Number(variant.price),
+      config: item.config ?? {},
+      config_label: priced.label || null,
       quantity: item.quantity,
       total_price,
     };

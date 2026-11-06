@@ -36,6 +36,18 @@ function shapeForGrid(row: any) {
     title: row.title,
     description: row.description,
     category: row.category,
+    /** Shop groups it is listed under — always includes its type's group. */
+    categories: row.categories?.length ? row.categories : (row.furniture_types?.shop_group ? [row.furniture_types.shop_group] : []),
+    certificates: Array.isArray(row.certificates) ? row.certificates : [],
+    patents: Array.isArray(row.patents) ? row.patents : [],
+    origin: row.origin ?? null,
+    origin_country: row.origin_country ?? null,
+    ships_to: row.ships_to?.length ? row.ships_to : ['SA'],
+    /** 'metre': base_price and variant prices are per metre of width */
+    price_unit: row.price_unit === 'metre' ? 'metre' : 'unit',
+    min_width_cm: row.min_width_cm ?? null,
+    max_width_cm: row.max_width_cm ?? null,
+    options: Array.isArray(row.options) ? row.options : [],
     tags: row.tags ?? [],
     base_price: Number(row.base_price),
     /** Lowest active variant price — what the card should show. */
@@ -171,6 +183,8 @@ export const getProducts = async (req: Request, res: Response) => {
       min_price,
       max_price,
       in_stock,         // 'true' to hide sold-out
+      made_in,          // 'saudi' | 'international'
+      ships_to,         // ISO country code, e.g. 'AE'
       sort,             // price_asc | price_desc | lead_time | newest
       page = 1,
       limit = 12,
@@ -184,6 +198,8 @@ export const getProducts = async (req: Request, res: Response) => {
       .select(
         `id, retailer_id, canvas_model_id, type_id, title, description,
          category, tags, base_price, affiliate_url, specs_json, lead_time_days,
+         categories, certificates, patents, origin, origin_country, ships_to,
+         price_unit, min_width_cm, max_width_cm, options,
          created_at,
          furniture_types!inner(id, name, shop_group, group_sort),
          retailers(id, name, logo_url, shipping_policy_json),
@@ -193,8 +209,16 @@ export const getProducts = async (req: Request, res: Response) => {
       // Only listings an admin has approved are on sale.
       .eq('listing_status', 'approved');
  
+    // A listing can sit under several groups; products.categories always
+    // holds its type's group as well (see 20261106), so one test covers both.
     if (group && group !== 'All') {
-      query = query.eq('furniture_types.shop_group', String(group));
+      query = query.contains('categories', [String(group)]);
+    }
+    if (made_in === 'saudi' || made_in === 'international') {
+      query = query.eq('origin', made_in);
+    }
+    if (typeof ships_to === 'string' && /^[A-Za-z]{2}$/.test(ships_to)) {
+      query = query.contains('ships_to', [ships_to.toUpperCase()]);
     }
     if (category && category !== 'All') {
       query = query.ilike('category', `%${category}%`);
@@ -270,6 +294,8 @@ export const getProductById = async (req: Request, res: Response) => {
       .select(
         `id, retailer_id, canvas_model_id, type_id, title, description,
          category, tags, base_price, affiliate_url, specs_json, lead_time_days,
+         categories, certificates, patents, origin, origin_country, ships_to,
+         price_unit, min_width_cm, max_width_cm, options,
          created_at,
          furniture_types(id, name, shop_group, group_sort),
          retailers(id, name, logo_url, shipping_policy_json),
@@ -359,6 +385,8 @@ export const getCanvasProductLink = async (req: Request, res: Response) => {
       .select(
         `id, retailer_id, canvas_model_id, type_id, title, description,
          category, tags, base_price, affiliate_url, specs_json, lead_time_days,
+         categories, certificates, patents, origin, origin_country, ships_to,
+         price_unit, min_width_cm, max_width_cm, options,
          created_at,
          furniture_types(id, name, shop_group, group_sort),
          retailers(id, name, logo_url, shipping_policy_json),
@@ -412,6 +440,7 @@ export const getCanvasItems = async (req: Request, res: Response) => {
 
     let q = supabase.from('products')
       .select(`id, title, category, type_id, tags, base_price, listing_status, specs_json, created_at,
+               price_unit, min_width_cm, max_width_cm, options,
                retailers ( name ), product_variants ( id, price, images, dimensions_cm, is_active, stock_quantity )`)
       .not('specs_json->>model_url', 'is', null);
     if (ids.length) {
@@ -450,6 +479,12 @@ export const getCanvasItems = async (req: Request, res: Response) => {
         in_stock: inStock.length > 0,
         variant_id: buy?.id ?? null,
         variant_price: buy ? Number(buy.price) : null,
+        // per-metre listings: price is per metre of width; the canvas prices
+        // a stretched piece from these
+        price_unit: p.price_unit === 'metre' ? 'metre' : 'unit',
+        min_width_cm: p.min_width_cm ?? null,
+        max_width_cm: p.max_width_cm ?? null,
+        options: Array.isArray(p.options) ? p.options : [],
       };
     });
     return res.json({ success: true, items });
@@ -507,26 +542,40 @@ export const trackAffiliateClick = async (req: Request, res: Response) => {
 
 export const getFacets = async (_req: Request, res: Response) => {
   try {
-    const [groupsRes, vendorsRes, priceRes] = await Promise.all([
-      supabase.from('products_shop').select('shop_group, group_sort'),
+    const [groupsRes, vendorsRes, priceRes, typesRes] = await Promise.all([
+      // Approved listings only, counted under every group they're listed in.
+      supabase.from('products').select('categories, origin, furniture_types(shop_group)').eq('listing_status', 'approved'),
       supabase.from('retailers').select('id, name, logo_url').order('name'),
       supabase.from('products').select('base_price').eq('listing_status', 'approved').order('base_price', { ascending: true }),
+      supabase.from('furniture_types').select('shop_group, group_sort'),
     ]);
  
     if (groupsRes.error)  throw groupsRes.error;
     if (vendorsRes.error) throw vendorsRes.error;
     if (priceRes.error)   throw priceRes.error;
  
-    const counts = new Map<string, { group: string; sort: number; count: number }>();
-    for (const row of groupsRes.data ?? []) {
-      const key = row.shop_group ?? 'Other';
-      const existing = counts.get(key);
-      if (existing) existing.count += 1;
-      else counts.set(key, { group: key, sort: row.group_sort ?? 99, count: 1 });
+    const sortOf = new Map<string, number>();
+    for (const t of typesRes.data ?? []) {
+      if (t.shop_group && !sortOf.has(t.shop_group)) sortOf.set(t.shop_group, t.group_sort ?? 99);
     }
- 
+    const counts = new Map<string, { group: string; sort: number; count: number }>();
+    const origins = { saudi: 0, international: 0 };
+    const rows = groupsRes.data ?? [];
+    for (const row of rows as any[]) {
+      const own = row.furniture_types?.shop_group;
+      const keys = new Set<string>(row.categories?.length ? row.categories : [own ?? 'Other']);
+      for (const key of keys) {
+        const existing = counts.get(key);
+        if (existing) existing.count += 1;
+        else counts.set(key, { group: key, sort: sortOf.get(key) ?? 99, count: 1 });
+      }
+      if (row.origin === 'saudi') origins.saudi += 1;
+      else if (row.origin === 'international') origins.international += 1;
+    }
+
     const groups = [...counts.values()].sort((a, b) => a.sort - b.sort);
-    const total = groups.reduce((n, g) => n + g.count, 0);
+    // "All" counts listings, not group memberships.
+    const total = rows.length;
  
     const prices = (priceRes.data ?? []).map(r => Number(r.base_price));
  
@@ -535,6 +584,7 @@ export const getFacets = async (_req: Request, res: Response) => {
       // "All" first, matching the design's leading chip.
       groups: [{ group: 'All', sort: 0, count: total }, ...groups],
       vendors: vendorsRes.data ?? [],
+      origins,
       price: {
         min: prices.length ? Math.floor(prices[0]) : 0,
         max: prices.length ? Math.ceil(prices[prices.length - 1]) : 0,

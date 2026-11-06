@@ -63,6 +63,7 @@ export async function updateVendorProfile(req: AuthRequest, res: Response) {
     if (body.city !== undefined) updateData.city = body.city || null;
     if (body.country !== undefined) updateData.country = body.country || null;
     if (body.logo_url !== undefined) updateData.logo_url = body.logo_url || null;
+    if (body.store_name !== undefined) updateData.store_name = body.store_name;
 
     const { data, error } = await supabase
       .from('vendor_profiles')
@@ -73,6 +74,16 @@ export async function updateVendorProfile(req: AuthRequest, res: Response) {
 
     if (error) {
       return res.status(400).json({ success: false, error: error.message });
+    }
+
+    // Shoppers see the storefront (retailers), not the vendor profile — keep
+    // its name and logo in step.
+    const shop: Record<string, any> = {};
+    if (body.logo_url !== undefined) shop.logo_url = body.logo_url || null;
+    if (body.store_name !== undefined) shop.name = body.store_name;
+    if (Object.keys(shop).length) {
+      const { error: shopErr } = await supabase.from('retailers').update(shop).eq('vendor_id', userId);
+      if (shopErr) console.error('updateVendorProfile: storefront sync failed:', shopErr.message);
     }
 
     return res.status(200).json({
