@@ -134,6 +134,34 @@ export const furnitureItemSchema = z.object({
   }).optional(),
 });
 
+// ── Kitchen builder ──────────────────────────────────────────────────────────
+// Runs of cabinets along a wall face. Widths are real metres; `start` is the
+// run's left end along the wall, scene metres. Kept strict so nothing but
+// kitchen data can ride along into room_data.
+const kitchenModuleSchema = z.object({
+  id:    z.string().max(64),
+  kind:  z.enum(['base-door', 'drawer-base', 'sink-base', 'dishwasher', 'cooktop-gas',
+                 'cooktop-induction', 'oven-tower', 'tall-pantry', 'fridge-single']),
+  width: z.number().min(0.15).max(1.5),
+  upper: z.enum(['cabinet', 'hood']).nullable(),
+});
+export const kitchenSchema = z.object({
+  runs: z.array(z.object({
+    id:    z.string().max(64),
+    wall:  z.object({ index: z.number().int().min(0).max(1000), key: z.string().max(64) }),
+    side:  z.union([z.literal(1), z.literal(-1)]),
+    start: z.number(),
+    modules: z.array(kitchenModuleSchema).max(40),
+  })).max(30),
+  style: z.object({
+    frontStyle:  z.enum(['slab', 'shaker', 'raised-arch']),
+    handleStyle: z.enum(['bar', 'knob', 'cutout', 'none']),
+    front:       z.string().max(24),
+    countertop:  z.string().max(40),
+    hardware:    z.enum(['chrome', 'black', 'brass']),
+  }),
+});
+
 export const saveFurnitureSchema = z.object({
   furniture: z.array(furnitureItemSchema).max(300),
   // per-side wall paint: "wallKey:A" | "wallKey:B" → css color
@@ -146,6 +174,8 @@ export const saveFurnitureSchema = z.object({
   // validate() replaces req.body with the parsed result, so any key missing
   // from this schema is silently stripped before the controller sees it.
   floor_surfaces: z.record(z.string(), z.string().max(64)).optional(),
+  // Kitchen builder: cabinet runs along walls, and the kitchen's style.
+  kitchen: kitchenSchema.optional(),
 });
 
 // ── Sharing ──────────────────────────────────────────────────────────────────
