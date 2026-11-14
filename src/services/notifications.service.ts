@@ -17,7 +17,7 @@ import { supabase } from './supabase';
 
 export type NotificationType =
   | 'order_status' | 'shipment' | 'return' | 'cancellation' | 'vendor_approval'
-  | 'listing' | 'payout' | 'support' | 'review' | 'stock' | 'admin';
+  | 'listing' | 'payout' | 'support' | 'review' | 'stock' | 'admin' | 'render';
 
 export interface NotificationInput {
   title: string;
