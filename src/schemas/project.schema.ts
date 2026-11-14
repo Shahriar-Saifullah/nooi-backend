@@ -176,6 +176,14 @@ export const saveFurnitureSchema = z.object({
   floor_surfaces: z.record(z.string(), z.string().max(64)).optional(),
   // Kitchen builder: cabinet runs along walls, and the kitchen's style.
   kitchen: kitchenSchema.optional(),
+  // Show / hide: what is hidden in the 3D view — groups (a category or
+  // "lighting"), furniture types, single pieces, the kitchen.
+  hidden: z.object({
+    groups: z.array(z.string().max(40)).max(30),
+    types:  z.array(z.string().max(80)).max(300),
+    items:  z.array(z.string().max(80)).max(500),
+    kitchen: z.boolean().optional(),
+  }).optional(),
 });
 
 // ── Sharing ──────────────────────────────────────────────────────────────────

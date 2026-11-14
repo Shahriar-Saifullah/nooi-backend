@@ -20,6 +20,8 @@ import notificationRoutes   from './routes/notifications.routes';
 import supportRoutes        from './routes/support.routes';
 import termsRoutes          from './routes/terms.routes';
 import searchRoutes         from './routes/search.routes';
+import favouriteRoutes      from './routes/favourites.routes';
+import renderRoutes         from './routes/render.routes';
 import { errorHandler }     from './middleware/errorHandler';
 import { startModelWorker } from './services/model3d';
 import { stripeWebhookHandler, moyasarWebhookHandler } from './controllers/orders.controller';
@@ -68,6 +70,8 @@ app.use('/notifications',  notificationRoutes);
 app.use('/support',        supportRoutes);
 app.use('/terms',          termsRoutes);
 app.use('/search',         searchRoutes);
+app.use('/favourites',     favouriteRoutes);
+app.use('/renders',        renderRoutes);
 
 // Error handler
 app.use(errorHandler);

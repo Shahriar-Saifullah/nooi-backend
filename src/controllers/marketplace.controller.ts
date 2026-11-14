@@ -183,6 +183,7 @@ export const getProducts = async (req: Request, res: Response) => {
       min_price,
       max_price,
       in_stock,         // 'true' to hide sold-out
+      ids,              // comma-separated product ids (favourites)
       made_in,          // 'saudi' | 'international'
       ships_to,         // ISO country code, e.g. 'AE'
       sort,             // price_asc | price_desc | lead_time | newest
@@ -213,6 +214,10 @@ export const getProducts = async (req: Request, res: Response) => {
     // holds its type's group as well (see 20261106), so one test covers both.
     if (group && group !== 'All') {
       query = query.contains('categories', [String(group)]);
+    }
+    if (typeof ids === 'string' && ids) {
+      const list = ids.split(',').map(s => s.trim()).filter(s => /^[0-9a-f-]{36}$/i.test(s)).slice(0, 100);
+      query = query.in('id', list.length ? list : ['00000000-0000-0000-0000-000000000000']);
     }
     if (made_in === 'saudi' || made_in === 'international') {
       query = query.eq('origin', made_in);
