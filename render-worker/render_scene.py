@@ -95,12 +95,37 @@ def set_input(node, names, value):
             return
 
 
+# The editor's selection glow (#c7de7d, linear) — a selected floor, wall or
+# door is exported glowing green. It must never reach a photo.
+SELECTION_GLOW = (0.571, 0.730, 0.212)
+
+
+def is_selection_glow(p):
+    e = p.inputs.get("Emission Color") or p.inputs.get("Emission")
+    if e is None or e.is_linked:
+        return False
+    c = e.default_value
+    return all(abs(c[i] - SELECTION_GLOW[i]) < 0.03 for i in range(3))
+
+
 def fix_materials():
     glass_mats = set()
     for mat in bpy.data.materials:
         name = (mat.name or "").lower()
         p = principled(mat)
         if p is None:
+            continue
+        if is_selection_glow(p):
+            set_input(p, ["Emission Strength"], 0.0)
+            log(f"removed selection glow: {mat.name}")
+        if name.startswith("nooi-floor"):
+            # A polished floor seen at a low angle mirrors the bright window
+            # and ceiling, and the stone's own pattern washes out to white.
+            # Tone the sheen down; it keeps its gloss.
+            r = p.inputs.get("Roughness")
+            if r is not None and not r.is_linked:
+                r.default_value = max(r.default_value, 0.32)
+            set_input(p, ["Specular IOR Level", "Specular"], 0.3)
             continue
         if name.startswith("nooi-glass"):
             glass_mats.add(mat.name)
@@ -183,6 +208,99 @@ def add_lights(spec):
         scene.collection.objects.link(o)
         o.location = to_blender(lamp["position"])
     return sun_dir
+
+
+# ── fill light ─────────────────────────────────────────────────────────────
+#
+# A real interior is far darker than its windows: lit by daylight alone, the
+# picture has to be brightened several stops to see the room, and by then the
+# floor by the window and the ceiling are washed out. Interior photographers
+# solve it with a soft fill from behind the camera. So do we: a large, soft
+# light at the camera that lights only what the camera sees and never shows up
+# itself — not in the picture, not in a reflection.
+#
+# Its strength is measured, not guessed: the room is probed once with daylight
+# only and once with the fill only, and the fill set to FILL_SHARE of the
+# daylight. Same look in a bright room and a dark one.
+
+FILL_SHARE = 0.5
+
+
+def add_fill(spec):
+    c = spec["camera"]
+    data = bpy.data.lights.new("NooiFill", "AREA")
+    data.shape = "DISK"
+    data.size = 2.0
+    data.energy = 100.0
+    data.color = (1.0, 0.97, 0.93)  # a touch warm, like bounced daylight
+    o = bpy.data.objects.new("NooiFill", data)
+    bpy.context.scene.collection.objects.link(o)
+    o.location = to_blender(c["position"])
+    qx, qy, qz, qw = c["quaternion"]
+    o.rotation_mode = "QUATERNION"
+    # an area light shines down its -Z, which is where the camera looks
+    o.rotation_quaternion = WORLD_ROT @ Quaternion((qw, qx, qy, qz))
+    o.visible_camera = False
+    o.visible_glossy = False
+    o.visible_transmission = False
+    return o
+
+
+def linear_mean(path):
+    img = bpy.data.images.load(path)
+    px = img.pixels[:]
+    n = max(1, len(px) // 4)
+    total = 0.0
+    for i in range(0, len(px), 4):
+        total += 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]
+    bpy.data.images.remove(img)
+    return total / n
+
+
+def calibrate_fill(fill, out_dir, width, height):
+    scene = bpy.context.scene
+    keep = (scene.cycles.samples, scene.render.resolution_x, scene.render.resolution_y, scene.cycles.time_limit)
+    aspect = width / height
+    scene.render.resolution_x = 200 if aspect >= 1 else int(200 * aspect)
+    scene.render.resolution_y = int(200 / aspect) if aspect >= 1 else 200
+    scene.cycles.samples = 32
+    scene.cycles.time_limit = 0
+    probe = os.path.join(out_dir, "fill-probe.exr")
+
+    others = [o for o in scene.objects if o.type == "LIGHT" and o != fill]
+    bg = None
+    if scene.world and scene.world.node_tree:
+        bg = next((n for n in scene.world.node_tree.nodes if n.type == "BACKGROUND"), None)
+
+    fill.hide_render = True
+    save(probe)
+    natural = linear_mean(probe)
+
+    fill.hide_render = False
+    hidden = [(o, o.hide_render) for o in others]
+    for o in others:
+        o.hide_render = True
+    strength = bg.inputs["Strength"].default_value if bg else None
+    if bg:
+        bg.inputs["Strength"].default_value = 0.0
+    save(probe)
+    alone = linear_mean(probe)
+    for o, h in hidden:
+        o.hide_render = h
+    if bg:
+        bg.inputs["Strength"].default_value = strength
+
+    scene.cycles.samples, scene.render.resolution_x, scene.render.resolution_y, scene.cycles.time_limit = keep
+    try:
+        os.remove(probe)
+    except OSError:
+        pass
+    if alone <= 1e-6:
+        fill.hide_render = True
+        return 0.0
+    fill.data.energy = max(1.0, min(5000.0, 100.0 * FILL_SHARE * max(natural, 1e-4) / alone))
+    log(f"fill: daylight {natural:.4f}, fill@100W {alone:.4f} -> {fill.data.energy:.0f} W")
+    return fill.data.energy
 
 
 def add_world(spec, sun_dir):
@@ -270,7 +388,8 @@ def configure(spec, width, height, samples, time_limit):
     vs = scene.view_settings
     vs.view_transform = "AgX"
     try:
-        vs.look = "AgX - Base Contrast"
+        # a little more contrast than AgX's default, closer to the live view
+        vs.look = "AgX - Medium High Contrast"
     except TypeError:
         pass
 
@@ -280,6 +399,8 @@ def save(path, quality=92):
     if path.lower().endswith((".jpg", ".jpeg")):
         s.file_format = "JPEG"
         s.quality = quality
+    elif path.lower().endswith(".exr"):
+        s.file_format = "OPEN_EXR"
     else:
         s.file_format = "PNG"
     s.color_mode = "RGB"
@@ -288,19 +409,44 @@ def save(path, quality=92):
 
 
 # Where the average display brightness of a well-exposed interior sits.
-TARGET_MEAN = 0.6
+TARGET_MEAN = 0.46
 
 
-def mean_brightness(path):
+def probe_stats(path):
+    """Average brightness and average colour of a probe render, as displayed
+    (an 8-bit PNG comes back as its stored display values)."""
     img = bpy.data.images.load(path)
     px = img.pixels[:]
-    n = len(px) // 4
-    total = 0.0
-    # an 8-bit PNG comes back as its stored (display) values
+    n = max(1, len(px) // 4)
+    r = g = b = 0.0
     for i in range(0, len(px), 4):
-        total += 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]
+        r += px[i]; g += px[i + 1]; b += px[i + 2]
     bpy.data.images.remove(img)
-    return total / max(1, n)
+    r, g, b = r / n, g / n, b / n
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b, (r, g, b)
+
+
+# How far to neutralise a colour cast (0 = leave it, 1 = make the room grey
+# on average). Half: a green marble floor tints the ceiling a little, as it
+# would in life, without the whole picture going green.
+WHITE_BALANCE_STRENGTH = 0.5
+
+
+def set_white_balance(avg_display):
+    vs = bpy.context.scene.view_settings
+    if not hasattr(vs, "white_balance_whitepoint"):
+        return None
+    lin = [max(1e-4, c) ** 2.2 for c in avg_display]
+    lum = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+    if lum <= 1e-4:
+        return None
+    k = WHITE_BALANCE_STRENGTH
+    wp = tuple(1 + (c / lum - 1) * k for c in lin)
+    # never more than a gentle correction
+    wp = tuple(min(1.25, max(0.8, c)) for c in wp)
+    vs.use_white_balance = True
+    vs.white_balance_whitepoint = wp
+    return wp
 
 
 def auto_expose(out_dir, width, height):
@@ -308,16 +454,22 @@ def auto_expose(out_dir, width, height):
     scene = bpy.context.scene
     keep = (scene.cycles.samples, scene.render.resolution_x, scene.render.resolution_y, scene.cycles.time_limit)
     aspect = width / height
-    scene.render.resolution_x = 240 if aspect >= 1 else int(240 * aspect)
-    scene.render.resolution_y = int(240 / aspect) if aspect >= 1 else 240
-    scene.cycles.samples = 24
+    scene.render.resolution_x = 320 if aspect >= 1 else int(320 * aspect)
+    scene.render.resolution_y = int(320 / aspect) if aspect >= 1 else 320
+    # enough samples that noise doesn't skew the average (denoising is on)
+    scene.cycles.samples = 48
     scene.cycles.time_limit = 0
     probe = os.path.join(out_dir, "exposure-probe.png")
     ev = 0.0
-    for _ in range(2):
+    for i in range(3):
         scene.view_settings.exposure = ev
         save(probe)
-        m = mean_brightness(probe)
+        m, avg = probe_stats(probe)
+        if i == 0:
+            wp = set_white_balance(avg)
+            log(f"white balance: avg {tuple(round(c, 3) for c in avg)} -> whitepoint {wp and tuple(round(c, 3) for c in wp)}")
+            save(probe)
+            m, avg = probe_stats(probe)
         log(f"probe at {ev:+.2f} EV: mean {m:.3f}")
         if m <= 1e-4:
             ev += 3
@@ -362,6 +514,8 @@ def main():
     log(f"device {device}; {width}x{height} @ {samples} spp; import {time.time() - t0:.1f}s")
 
     t1 = time.time()
+    fill = add_fill(spec)
+    calibrate_fill(fill, os.path.dirname(os.path.abspath(out)) or ".", width, height)
     ev = auto_expose(os.path.dirname(os.path.abspath(out)) or ".", width, height)
     log(f"exposure {ev:+.2f} EV ({time.time() - t1:.1f}s)")
 
