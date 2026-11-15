@@ -84,6 +84,10 @@ def handler(job):
             [BLENDER, "-b", "--factory-startup", "-noaudio", "-P", SCRIPT, "--", scene, spec_path, out, stats_path],
             capture_output=True, text=True, timeout=limit,
         )
+        # Blender's own summary lines, so they show in the RunPod logs
+        for line in (proc.stdout or "").splitlines():
+            if "[nooi-render]" in line:
+                print(line, flush=True)
         if proc.returncode != 0 or not os.path.exists(out):
             tail = (proc.stdout or "")[-1500:] + (proc.stderr or "")[-1500:]
             raise RuntimeError(f"blender failed ({proc.returncode}): {tail}")
