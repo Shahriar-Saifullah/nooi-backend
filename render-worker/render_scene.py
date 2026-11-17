@@ -108,6 +108,9 @@ def is_selection_glow(p):
     return all(abs(c[i] - SELECTION_GLOW[i]) < 0.03 for i in range(3))
 
 
+EMISSIVE_BOOST = 6.0
+
+
 def fix_materials():
     glass_mats = set()
     for mat in bpy.data.materials:
@@ -139,6 +142,14 @@ def fix_materials():
                 if link.to_node == p and link.to_socket.name == "Alpha":
                     mat.node_tree.links.remove(link)
         else:
+            # Lit lamp shades, LED strips, screens with a picture: in the
+            # browser their glow is a hint; in a showroom render they are the
+            # light sources that make a room look lived in.
+            es = p.inputs.get("Emission Strength")
+            ec = p.inputs.get("Emission Color") or p.inputs.get("Emission")
+            if es is not None and ec is not None and es.default_value > 0 and (
+                    ec.is_linked or max(ec.default_value[:3]) > 0.02):
+                es.default_value *= EMISSIVE_BOOST
             # A web material at 0 roughness is a mirror; nothing in a room is.
             r = p.inputs.get("Roughness")
             if r is not None and not r.is_linked and r.default_value < 0.08:
@@ -156,7 +167,35 @@ def fix_materials():
     log(f"glass objects: {n}")
 
 
-def add_camera(spec):
+# Interior photographers keep vertical lines vertical: the camera stays level
+# and the frame is slid up or down (a shift lens) instead of tilting. A tilted
+# camera makes walls and doors lean inwards — the quickest tell of an amateur
+# render. Views looking steeply down (the overviews) keep their tilt.
+STRAIGHTEN_MAX_DEG = 25
+
+
+def add_pano_camera(spec):
+    """360° panorama (equirectangular, 2:1). The middle of the image looks
+    towards three.js -Z, and the image runs left to right as you turn right —
+    the tour viewer relies on exactly this to put the room pins in place."""
+    c = spec["camera"]
+    data = bpy.data.cameras.new("NooiPano")
+    data.type = "PANO"
+    data.panorama_type = "EQUIRECTANGULAR"
+    data.clip_start = 0.03
+    data.clip_end = 1000
+    cam = bpy.data.objects.new("NooiPano", data)
+    bpy.context.scene.collection.objects.link(cam)
+    cam.location = to_blender(c["position"])
+    cam.rotation_mode = "XYZ"
+    # level, looking along Blender +Y (= three.js -Z)
+    cam.rotation_euler = (math.pi / 2, 0.0, 0.0)
+    bpy.context.scene.camera = cam
+
+
+def add_camera(spec, width, height):
+    if spec.get("panorama"):
+        return add_pano_camera(spec)
     c = spec["camera"]
     data = bpy.data.cameras.new("NooiCamera")
     data.sensor_fit = "VERTICAL"
@@ -168,7 +207,17 @@ def add_camera(spec):
     cam.location = to_blender(c["position"])
     qx, qy, qz, qw = c["quaternion"]
     cam.rotation_mode = "QUATERNION"
-    cam.rotation_quaternion = WORLD_ROT @ Quaternion((qw, qx, qy, qz))
+    rot = WORLD_ROT @ Quaternion((qw, qx, qy, qz))
+    cam.rotation_quaternion = rot
+    fwd = rot @ Vector((0, 0, -1))
+    pitch = math.asin(max(-1.0, min(1.0, fwd.z)))
+    flat = Vector((fwd.x, fwd.y, 0))
+    if abs(math.degrees(pitch)) <= STRAIGHTEN_MAX_DEG and flat.length > 1e-3:
+        cam.rotation_quaternion = flat.normalized().to_track_quat("-Z", "Y")
+        # same centre of view, reached by shifting instead of tilting
+        shift = math.tan(pitch) / (2 * math.tan(data.angle_y / 2))
+        data.shift_y = shift * (height / width if width >= height else 1.0)
+        log(f"verticals straightened (pitch {math.degrees(pitch):+.1f} deg)")
     bpy.context.scene.camera = cam
 
 
@@ -188,7 +237,8 @@ def add_lights(spec):
         data = bpy.data.lights.new("NooiSun", "SUN")
         data.energy = sun["intensity"] * SUN_STRENGTH_PER_UNIT
         data.color = hex_rgb(sun["color"])
-        data.angle = math.radians(1.2)  # a little softer than the real 0.53 deg
+        # softer than the real sun (0.53 deg): showroom light, not harsh patches
+        data.angle = math.radians(3.0)
         o = bpy.data.objects.new("NooiSun", data)
         scene.collection.objects.link(o)
         o.rotation_mode = "QUATERNION"
@@ -223,11 +273,25 @@ def add_lights(spec):
 # only and once with the fill only, and the fill set to FILL_SHARE of the
 # daylight. Same look in a bright room and a dark one.
 
-FILL_SHARE = 0.5
+FILL_SHARE = 0.7
 
 
 def add_fill(spec):
     c = spec["camera"]
+    if spec.get("panorama"):
+        # a panorama looks every way at once: a soft sphere light at the
+        # camera instead of a panel behind it
+        data = bpy.data.lights.new("NooiFill", "POINT")
+        data.shadow_soft_size = 0.6
+        data.energy = 100.0
+        data.color = (1.0, 0.97, 0.93)
+        o = bpy.data.objects.new("NooiFill", data)
+        bpy.context.scene.collection.objects.link(o)
+        o.location = to_blender(c["position"])
+        o.visible_camera = False
+        o.visible_glossy = False
+        o.visible_transmission = False
+        return o
     data = bpy.data.lights.new("NooiFill", "AREA")
     data.shape = "DISK"
     data.size = 2.0
@@ -388,8 +452,8 @@ def configure(spec, width, height, samples, time_limit):
     vs = scene.view_settings
     vs.view_transform = "AgX"
     try:
-        # a little more contrast than AgX's default, closer to the live view
-        vs.look = "AgX - Medium High Contrast"
+        # the soft, airy "showroom" look of professional interior renders
+        vs.look = "AgX - Base Contrast"
     except TypeError:
         pass
 
@@ -409,21 +473,34 @@ def save(path, quality=92):
 
 
 # Where the average display brightness of a well-exposed interior sits.
-TARGET_MEAN = 0.46
+# Measured on the client's Kujiale reference tours: average 0.55, brightest
+# 5 % at 0.83 — bright and airy without burning out the whites.
+TARGET_MEAN = 0.56
+# The brightest 5 % of the picture stays below this (display value).
+HIGHLIGHT_MAX = 0.86
 
 
 def probe_stats(path):
-    """Average brightness and average colour of a probe render, as displayed
-    (an 8-bit PNG comes back as its stored display values)."""
+    """Average brightness and colour of a probe render, and its brightest 5 %,
+    as DISPLAYED. Blender hands a loaded PNG back as linear values, so they are
+    converted back to display values first (sRGB curve)."""
     img = bpy.data.images.load(path)
     px = img.pixels[:]
     n = max(1, len(px) // 4)
     r = g = b = 0.0
+    lums = []
+    def disp(c):
+        return 12.92 * c if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
     for i in range(0, len(px), 4):
-        r += px[i]; g += px[i + 1]; b += px[i + 2]
+        dr, dg, db = disp(px[i]), disp(px[i + 1]), disp(px[i + 2])
+        r += dr; g += dg; b += db
+        lums.append(0.2126 * dr + 0.7152 * dg + 0.0722 * db)
     bpy.data.images.remove(img)
     r, g, b = r / n, g / n, b / n
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b, (r, g, b)
+    lums.sort()
+    # the brightest 5 % — white sofas, a marble floor, a white ceiling
+    p95 = lums[int(len(lums) * 0.95)] if lums else 0.0
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b, (r, g, b), p95
 
 
 # How far to neutralise a colour cast (0 = leave it, 1 = make the room grey
@@ -464,20 +541,26 @@ def auto_expose(out_dir, width, height):
     for i in range(3):
         scene.view_settings.exposure = ev
         save(probe)
-        m, avg = probe_stats(probe)
+        m, avg, p95 = probe_stats(probe)
         if i == 0:
             wp = set_white_balance(avg)
             log(f"white balance: avg {tuple(round(c, 3) for c in avg)} -> whitepoint {wp and tuple(round(c, 3) for c in wp)}")
             save(probe)
-            m, avg = probe_stats(probe)
-        log(f"probe at {ev:+.2f} EV: mean {m:.3f}")
+            m, avg, p95 = probe_stats(probe)
+        log(f"probe at {ev:+.2f} EV: mean {m:.3f}, brightest 5% {p95:.3f}")
         if m <= 1e-4:
             ev += 3
             continue
         # AgX is close to log in the mid-tones: about 1 stop per 0.1 of mean
-        step = max(-3.0, min(3.0, (TARGET_MEAN - m) / 0.1))
+        step = (TARGET_MEAN - m) / 0.1
+        # ...but never so bright that white things lose their detail. A dark
+        # walnut wall pulls the average down; brightening until the average is
+        # "right" would burn out the white sofa and the marble floor beside it.
+        if p95 > HIGHLIGHT_MAX:
+            step = min(step, (HIGHLIGHT_MAX - p95) / 0.04)
+        step = max(-3.0, min(3.0, step))
         ev = max(-4.0, min(5.0, ev + step))
-        if abs(TARGET_MEAN - m) < 0.03:
+        if abs(step) < 0.15:
             break
     scene.cycles.samples, scene.render.resolution_x, scene.render.resolution_y, scene.cycles.time_limit = keep
     scene.view_settings.exposure = ev
@@ -497,8 +580,8 @@ def main():
     with open(spec_path) as f:
         spec = json.load(f)
 
-    width = int(max(64, min(7680, spec.get("width", 1920))))
-    height = int(max(64, min(7680, spec.get("height", 1080))))
+    width = int(max(64, min(8192, spec.get("width", 1920))))
+    height = int(max(64, min(8192, spec.get("height", 1080))))
     samples = int(max(8, min(4096, spec.get("samples", 256))))
     time_limit = float(spec.get("timeLimitS", 0) or 0)
 
@@ -506,7 +589,7 @@ def main():
     reset()
     import_scene(glb)
     fix_materials()
-    add_camera(spec)
+    add_camera(spec, width, height)
     sun_dir = add_lights(spec)
     add_world(spec, sun_dir)
     device = pick_device()

@@ -134,6 +134,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
     if (!(await ownProject(projectId, req.user!.id))) return res.status(404).json({ success: false, error: 'Project not found.' });
     const { data, error } = await supabase.from('render_jobs').select('*')
       .eq('project_id', projectId).eq('user_id', req.user!.id)
+      .eq('kind', 'image')  // a tour's panoramas live with the tour
       .in('status', ['queued', 'running', 'done', 'failed'])
       .order('created_at', { ascending: false }).limit(50);
     if (error) throw error;

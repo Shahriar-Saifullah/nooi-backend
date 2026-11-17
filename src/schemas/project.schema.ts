@@ -23,6 +23,15 @@ export const roomSchema = z.object({
   gridCol:    z.number().int().min(0).optional(),
   rowWeight:  z.number().positive().optional(),
   colWeight:  z.number().positive().optional(),
+  // ceiling design (frontend lib/walls/ceiling): stepped border with an LED
+  // cove, coffers or beams. Declared here, or validate() would strip it.
+  ceiling: z.object({
+    style:   z.enum(['flat', 'tray', 'coffered', 'beams']),
+    drop:    z.number().min(0.05).max(1).optional(),
+    inset:   z.number().min(0.1).max(3).optional(),
+    led:     z.boolean().optional(),
+    ledTone: z.enum(['warm', 'neutral', 'cool']).optional(),
+  }).optional(),
 });
 
 export type Room = z.infer<typeof roomSchema>;
@@ -184,6 +193,11 @@ export const saveFurnitureSchema = z.object({
     items:  z.array(z.string().max(80)).max(500),
     kitchen: z.boolean().optional(),
   }).optional(),
+  // Wall panelling per wall side: "wallKey:A" → { style, color? }
+  wall_panels: z.record(z.string().max(80), z.object({
+    style: z.enum(['box', 'chair-rail', 'wainscot', 'fluted']),
+    color: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
+  })).optional(),
 });
 
 // ── Sharing ──────────────────────────────────────────────────────────────────
