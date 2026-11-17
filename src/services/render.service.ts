@@ -142,6 +142,30 @@ export function cleanSpec(raw: unknown, quality: Quality): RenderSpec | null {
 }
 
 export const cleanQuality = (q: unknown): Quality => (q === 'high' ? 'high' : 'standard');
+
+export interface PanoSpec extends Omit<RenderSpec, 'camera'> {
+  panorama: true;
+  camera: { position: V3; quaternion: [0, 0, 0, 1]; fovDeg: 90 };
+}
+
+/** A panorama's spec: the lights from the browser, the point it's taken
+ *  from, and the size and samples from the quality. */
+export function cleanPanoSpec(lights: unknown, position: unknown, quality: Quality): PanoSpec | null {
+  const pos = vec(position, 3);
+  if (!pos) return null;
+  // reuse the image spec's checks for the sun and the lamps
+  const base = cleanSpec({ ...(lights as object ?? {}), camera: { position: pos, quaternion: [0, 0, 0, 1], fovDeg: 90 } }, quality);
+  if (!base) return null;
+  const q = PANO_QUALITY[quality];
+  return {
+    ...base,
+    panorama: true,
+    width: q.width,
+    height: q.height,
+    samples: q.samples,
+    camera: { position: pos as V3, quaternion: [0, 0, 0, 1], fovDeg: 90 },
+  };
+}
 export const SHA256 = /^[a-f0-9]{64}$/;
 
 export const scenePath = (userId: string, hash: string) => `render-scenes/${userId}/${hash}.glb.gz`;
@@ -163,20 +187,44 @@ export function limitReason(u: Usage, quality: Quality, cfg = renderConfig()): s
 
 const COUNTED: JobStatus[] = ['queued', 'running', 'done'];
 
+/** Why a tour of `rooms` panoramas can't start, or null. */
+export function tourLimitReason(u: Usage, rooms: number, quality: Quality, cfg = renderConfig()): string | null {
+  if (u.today + rooms * jobWeight('panorama') > cfg.dailyPerUser) {
+    return `A tour of ${rooms} rooms would go over today's render limit. Try fewer rooms, or again tomorrow.`;
+  }
+  if (u.monthUsd + rooms * PANO_QUALITY[quality].estimateUsd > cfg.monthlyCapUsd) {
+    return 'Renders are paused for the rest of the month. Please try again later.';
+  }
+  return null;
+}
+
+/** A panorama is about two images' worth of GPU time; it counts as two. */
+export const jobWeight = (kind: unknown) => (kind === 'panorama' ? 2 : 1);
+
+/** 360° panoramas: 2:1, one per room. */
+export const PANO_QUALITY: Record<Quality, { width: number; height: number; samples: number; timeLimitS: number; estimateUsd: number }> = {
+  standard: { width: 4096, height: 2048, samples: 256, timeLimitS: 300, estimateUsd: 0.06 },
+  high: { width: 8192, height: 4096, samples: 256, timeLimitS: 480, estimateUsd: 0.18 },
+};
+
+export const estimateFor = (kind: unknown, quality: unknown) =>
+  kind === 'panorama' ? PANO_QUALITY[cleanQuality(quality)].estimateUsd : QUALITY[cleanQuality(quality)].estimateUsd;
+
 export async function usageFor(userId: string): Promise<Usage> {
   const dayAgo = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
   const monthStart = new Date();
   monthStart.setUTCDate(1); monthStart.setUTCHours(0, 0, 0, 0);
 
   const [{ data: mine }, { data: month }] = await Promise.all([
-    supabase.from('render_jobs').select('status').eq('user_id', userId).in('status', COUNTED).gte('created_at', dayAgo),
-    supabase.from('render_jobs').select('status, quality, cost_usd').in('status', COUNTED).gte('created_at', monthStart.toISOString()),
+    supabase.from('render_jobs').select('status, kind').eq('user_id', userId).in('status', COUNTED).gte('created_at', dayAgo),
+    supabase.from('render_jobs').select('status, kind, quality, cost_usd').in('status', COUNTED).gte('created_at', monthStart.toISOString()),
   ]);
   const monthUsd = (month ?? []).reduce((s: number, j: any) =>
-    s + (j.status === 'done' ? Number(j.cost_usd) || 0 : QUALITY[cleanQuality(j.quality)].estimateUsd), 0);
+    s + (j.status === 'done' ? Number(j.cost_usd) || 0 : estimateFor(j.kind, j.quality)), 0);
   return {
-    today: (mine ?? []).length,
-    inFlight: (mine ?? []).filter((j: any) => j.status === 'queued' || j.status === 'running').length,
+    today: (mine ?? []).reduce((s: number, j: any) => s + jobWeight(j.kind), 0),
+    // only single photos: a tour queues several panoramas on purpose
+    inFlight: (mine ?? []).filter((j: any) => (j.status === 'queued' || j.status === 'running') && j.kind !== 'panorama').length,
     monthUsd,
   };
 }
@@ -221,7 +269,7 @@ export function secretMatches(given: unknown, cfg = renderConfig()): boolean {
 }
 
 /** Send a job to the GPU. Returns RunPod's job id. */
-export async function dispatch(job: { id: string; user_id: string; project_id: string; quality: string; spec: RenderSpec; scene_path: string }) {
+export async function dispatch(job: { id: string; user_id: string; project_id: string; quality: string; kind?: string; spec: RenderSpec | PanoSpec; scene_path: string }) {
   const cfg = renderConfig();
   const quality = cleanQuality(job.quality);
   const out = resultPath(job.user_id, job.project_id, job.id);
@@ -233,7 +281,7 @@ export async function dispatch(job: { id: string; user_id: string; project_id: s
   if (e1 || !sceneUrl?.signedUrl) throw new Error(`scene link: ${e1?.message ?? 'missing'}`);
   if (e2 || !upload?.signedUrl) throw new Error(`upload link: ${e2?.message ?? 'missing'}`);
 
-  const limit = QUALITY[quality].timeLimitS;
+  const limit = (job as any).kind === 'panorama' ? PANO_QUALITY[quality].timeLimitS : QUALITY[quality].timeLimitS;
   const res = await fetch(`${RUNPOD}/${cfg.endpointId}/run`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${cfg.apiKey}`, 'Content-Type': 'application/json' },
@@ -279,7 +327,7 @@ export async function applyProviderUpdate(payload: any): Promise<void> {
   if (!providerJobId || !next) return;
 
   const { data: job } = await supabase.from('render_jobs')
-    .select('id, user_id, project_id, status, result_path')
+    .select('id, user_id, project_id, status, result_path, tour_id')
     .eq('provider_job_id', providerJobId).maybeSingle();
   if (!job || TERMINAL.includes(job.status)) return;
 
@@ -304,6 +352,12 @@ export async function applyProviderUpdate(payload: any): Promise<void> {
   const { data: updated } = await supabase.from('render_jobs').update(patch)
     .eq('id', job.id).not('status', 'in', `(${TERMINAL.join(',')})`).select('id').maybeSingle();
   if (!updated) return;
+
+  // a tour's panoramas report once, when the whole tour is finished
+  if (job.tour_id) {
+    if (TERMINAL.includes(patch.status as JobStatus)) await finishTourIfDone(job.tour_id);
+    return;
+  }
 
   if (patch.status === 'done') {
     await notify(job.user_id, {
@@ -342,4 +396,29 @@ export async function publicJob(job: any) {
     createdAt: job.created_at,
     finishedAt: job.finished_at,
   };
+}
+
+/**
+ * When every panorama of a tour has finished: mark the tour done (or partly
+ * done, if some rooms failed) and tell its owner. Safe to call repeatedly —
+ * only the call that moves the tour out of "rendering" notifies.
+ */
+export async function finishTourIfDone(tourId: string): Promise<void> {
+  const { data: jobs } = await supabase.from('render_jobs').select('status').eq('tour_id', tourId);
+  if (!jobs?.length || jobs.some((j: any) => !TERMINAL.includes(j.status))) return;
+  const ok = jobs.filter((j: any) => j.status === 'done').length;
+  const status = ok === jobs.length ? 'done' : ok > 0 ? 'partial' : 'failed';
+  const { data: tour } = await supabase.from('tours')
+    .update({ status, finished_at: new Date().toISOString() })
+    .eq('id', tourId).eq('status', 'rendering')
+    .select('id, user_id, project_id').maybeSingle();
+  if (!tour) return;
+  await notify(tour.user_id, status === 'failed'
+    ? { title: 'A 360° tour failed', message: 'Something went wrong while rendering it. Please try again.', type: 'render', link: `/tour/${tour.id}` }
+    : {
+        title: 'Your 360° tour is ready',
+        message: status === 'partial' ? `${ok} of ${jobs.length} rooms are ready; the others failed.` : 'Open it to walk through your design.',
+        type: 'render',
+        link: `/tour/${tour.id}`,
+      });
 }

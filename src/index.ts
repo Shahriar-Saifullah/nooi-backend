@@ -22,6 +22,7 @@ import termsRoutes          from './routes/terms.routes';
 import searchRoutes         from './routes/search.routes';
 import favouriteRoutes      from './routes/favourites.routes';
 import renderRoutes         from './routes/render.routes';
+import tourRoutes           from './routes/tour.routes';
 import { errorHandler }     from './middleware/errorHandler';
 import { startModelWorker } from './services/model3d';
 import { stripeWebhookHandler, moyasarWebhookHandler } from './controllers/orders.controller';
@@ -72,6 +73,7 @@ app.use('/terms',          termsRoutes);
 app.use('/search',         searchRoutes);
 app.use('/favourites',     favouriteRoutes);
 app.use('/renders',        renderRoutes);
+app.use('/tours',          tourRoutes);
 
 // Error handler
 app.use(errorHandler);
