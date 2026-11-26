@@ -47,6 +47,9 @@ function shapeForGrid(row: any) {
     price_unit: row.price_unit === 'metre' ? 'metre' : 'unit',
     min_width_cm: row.min_width_cm ?? null,
     max_width_cm: row.max_width_cm ?? null,
+    /** made-to-measure guidance the factory confirms (never enforced) */
+    size_ranges: row.size_ranges && typeof row.size_ranges === 'object' ? row.size_ranges : {},
+    size_note: row.size_note ?? null,
     options: Array.isArray(row.options) ? row.options : [],
     tags: row.tags ?? [],
     base_price: Number(row.base_price),
@@ -200,7 +203,7 @@ export const getProducts = async (req: Request, res: Response) => {
         `id, retailer_id, canvas_model_id, type_id, title, description,
          category, tags, base_price, affiliate_url, specs_json, lead_time_days,
          categories, certificates, patents, origin, origin_country, ships_to,
-         price_unit, min_width_cm, max_width_cm, options,
+         price_unit, min_width_cm, max_width_cm, options, size_ranges, size_note,
          created_at,
          furniture_types!inner(id, name, shop_group, group_sort),
          retailers(id, name, logo_url, shipping_policy_json),
